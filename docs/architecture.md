@@ -73,3 +73,8 @@ The control plane:
 - Real-time control guarantees
 - Automatic failover between control planes
 - Decision-making at the edge beyond defined bounds
+
+## States
+
+- **ACTIVE**    → heartbeats arriving normally
+- **UNKNOWN**   → heartbeats missing beyond threshold
