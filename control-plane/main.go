@@ -20,6 +20,11 @@ const (
 	errMissingNodeID    = "missing node id"
 )
 
+const (
+	heartbeatExpiry = 30 * time.Second
+	sweepInterval   = 10 * time.Second
+)
+
 // Node Struct
 // use this Node Struct to return value to GET request
 type Node struct {
@@ -30,6 +35,11 @@ type Node struct {
 
 // Helper method to validate request method
 func requireMethod(w http.ResponseWriter, r *http.Request, method string) bool {
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusOK)
+		return false
+	}
+
 	if r.Method != method {
 		http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
 		return false
@@ -41,9 +51,9 @@ func requireMethod(w http.ResponseWriter, r *http.Request, method string) bool {
 func nodeIdMissing(w http.ResponseWriter, nodeID string) bool {
 	if nodeID == "" {
 		http.Error(w, errMissingNodeID, http.StatusBadRequest)
-		return false
+		return true
 	}
-	return true
+	return false
 }
 
 // Phase 1: heartbeat updates liveness metadata only.
@@ -52,12 +62,10 @@ func heartbeatHandler(w http.ResponseWriter, r *http.Request) {
 	if !requireMethod(w, r, http.MethodPost) {
 		return
 	}
-
 	nodeID := r.Header.Get("X-Node-ID")
 	if nodeIdMissing(w, nodeID) {
 		return
 	}
-
 	res, err := db.Exec(
 		`UPDATE nodes
 		SET last_heartbeat = ?, status = ?
@@ -66,23 +74,19 @@ func heartbeatHandler(w http.ResponseWriter, r *http.Request) {
 		"available",
 		nodeID,
 	)
-
 	if err != nil {
 		http.Error(w, "db error", http.StatusBadRequest)
 		return
 	}
-
 	rows, _ := res.RowsAffected()
 	if rows == 0 {
 		http.Error(w, "unknown node", http.StatusBadRequest)
 		return
 	}
-
 	log.Printf("[Heartbeat] node=%s time=%s",
 		nodeID,
 		time.Now().Format(time.RFC3339),
 	)
-
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("ack"))
 }
@@ -189,11 +193,39 @@ func initDB() error {
 	return err
 }
 
+func livenessSweep() {
+	ticker := time.NewTicker(sweepInterval)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		cutoff := time.Now().UTC().Add(-heartbeatExpiry)
+
+		res, err := db.Exec(`
+			UPDATE nodes
+			SET status = 'unavailable'
+			WHERE last_heartbeat < ?
+			  AND status != 'unavailable'
+		`, cutoff)
+
+		if err != nil {
+			log.Println("[LIVENESS_SWEEP] error:", err)
+			continue
+		}
+
+		affected, _ := res.RowsAffected()
+		if affected > 0 {
+			log.Printf("[LIVENESS_SWEEP] marked %d node(s) unavailable", affected)
+		}
+	}
+}
+
 func main() {
 
 	if err := initDB(); err != nil {
 		log.Fatal(err)
 	}
+
+	go livenessSweep()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/register", registrationHandler)
