@@ -1,3 +1,5 @@
 *.http
 go.sum
 *.db
+edge-agent/node*/
+*.exe
