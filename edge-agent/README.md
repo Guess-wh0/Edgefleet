@@ -90,3 +90,25 @@ It degrades gracefully.
 
 This file is a boundary.
 Crossing it is a bug.
+
+
+---
+
+## Start the Edge Agent
+
+Run directly:
+
+```bash
+go run .
+```
+
+Or build once and run:
+
+```bash
+go build -o edge-agent
+```
+
+to run multiple nodes run below in separate terminal with diff node names
+```bash
+$env:EDGE_NODE_DIR=".\nodeA"; $env:EDGE_HEARTBEAT_SEC="5"; $env:EDGE_HOSTNAME="node-A"; .\edge-agent.exe
+```

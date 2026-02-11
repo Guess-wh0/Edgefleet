@@ -1,8 +1,19 @@
-const (
-	controlPlaneBase = "http://localhost:8080"
-	nodeIDFile       = "node_id.txt"
-	heartbeatEvery   = 10 * time.Second
+package main
+
+import (
+	"io"
+	"log"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
 )
+
+const controlPlaneBase = "http://localhost:8080"
+
+var nodeIDFile = ""
 
 func loadNodeID() string {
 	data, err := os.ReadFile(nodeIDFile)
@@ -23,8 +34,8 @@ func registerNode() string {
 		nil,
 	)
 
-	req.Header.Set("X-Node-Hostname", "pico-2w")
-	req.Header.Set("X-Node-Arch", "arm")
+	req.Header.Set("X-Node-Hostname", getenv("EDGE_HOSTNAME", "edge-sim"))
+	req.Header.Set("X-Node-Arch", getenv("EDGE_ARCH", "amd64"))
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -59,15 +70,38 @@ func sendHeartbeat(nodeID string) {
 	log.Println("heartbeat sent")
 }
 
+func getenv(key, def string) string {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	return v
+}
+
+func getenvInt(key string, def int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	i, err := strconv.Atoi(v)
+	if err != nil {
+		return def
+	}
+	return i
+}
+
 func main() {
 	// connectWiFi() // platform-specific: implemented on Pico (TinyGo)
-
+	nodeDir := getenv("EDGE_NODE_DIR", ".")
+	_ = os.MkdirAll(nodeDir, 0755)
+	nodeIDFile = filepath.Join(nodeDir, "node_id.txt")
 	nodeID := loadNodeID()
 	if nodeID == "" {
 		nodeID = registerNode()
 	}
 
 	for {
+		heartbeatEvery := time.Duration(getenvInt("EDGE_HEARTBEAT_SEC", 10)) * time.Second
 		sendHeartbeat(nodeID)
 		time.Sleep(heartbeatEvery)
 	}
