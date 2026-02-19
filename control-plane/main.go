@@ -68,10 +68,9 @@ func heartbeatHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	res, err := db.Exec(
 		`UPDATE nodes
-		SET last_heartbeat = ?, status = ?
+		SET last_heartbeat = ?, status = 'active'
 		WHERE node_id = ?`,
 		time.Now().UTC(),
-		"available",
 		nodeID,
 	)
 	if err != nil {
@@ -83,7 +82,7 @@ func heartbeatHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unknown node", http.StatusBadRequest)
 		return
 	}
-	log.Printf("[Heartbeat] node=%s time=%s",
+	log.Printf("[Heartbeat][%s] marked ACTIVE at %s",
 		nodeID,
 		time.Now().Format(time.RFC3339),
 	)
@@ -200,22 +199,62 @@ func livenessSweep() {
 	for range ticker.C {
 		cutoff := time.Now().UTC().Add(-heartbeatExpiry)
 
-		res, err := db.Exec(`
-			UPDATE nodes
-			SET status = 'unavailable'
+		rows, err := db.Query(`
+			SELECT node_id, status
+			FROM nodes
 			WHERE last_heartbeat < ?
-			  AND status != 'unavailable'
+			  AND status != 'unknown'
 		`, cutoff)
 
 		if err != nil {
-			log.Println("[LIVENESS_SWEEP] error:", err)
+			log.Println("[SWEEP][ERROR]", err)
 			continue
 		}
 
-		affected, _ := res.RowsAffected()
-		if affected > 0 {
-			log.Printf("[LIVENESS_SWEEP] marked %d node(s) unavailable", affected)
+		var affected []string
+
+		for rows.Next() {
+			var nodeID, status string
+			rows.Scan(&nodeID, &status)
+
+			_, _ = db.Exec(`
+				UPDATE nodes
+				SET status = 'unknown'
+				WHERE node_id = ?
+			`, nodeID)
+
+			affected = append(affected, nodeID)
 		}
+
+		rows.Close()
+
+		for _, id := range affected {
+			log.Printf("[STATE][%s] ACTIVE → UNKNOWN", id)
+		}
+	}
+}
+
+func listNodes(w http.ResponseWriter, r *http.Request) {
+	rows, err := db.Query(`
+		SELECT node_id, status, last_heartbeat
+		FROM nodes
+	`)
+	if err != nil {
+		http.Error(w, "error", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var id, status string
+		var ts time.Time
+		rows.Scan(&id, &status, &ts)
+
+		fmt.Fprintf(w, "%s | %s | %s\n",
+			id,
+			status,
+			ts.Format(time.RFC3339),
+		)
 	}
 }
 
@@ -232,6 +271,7 @@ func main() {
 	mux.HandleFunc("/heartbeat", heartbeatHandler)
 	mux.HandleFunc("/desired-state/{nodeID}", getDesiredState)
 	mux.HandleFunc("/health", getHealthDetail)
+	mux.HandleFunc("/nodes", listNodes)
 
 	addr := ":8080"
 	log.Println("Control Plane starting on", addr)
