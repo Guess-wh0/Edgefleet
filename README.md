@@ -72,19 +72,19 @@ Anything else is a bug.
 
 ## Project Status
 
-**Phase 0 — Foundations: COMPLETE**
+**Phase 3 — Robustness & Persistence**
 
 Current state:
-- Architecture frozen
-- Principles defined
-- Failure model documented
-- Development phases locked
-- No code yet (intentionally)
+- State storage in control plane
+- Edge restart reconciliation
+- Drift detection after downtime
+- Replay-safe reconciliation
 
 Next phase will introduce:
-- A single edge node
-- A single control plane
-- A minimal reconciliation loop
+- Edge identity & registration
+- Signed desired state
+- Basic auth between edge and control plane
+- Rejection of untrusted commands
 
 ---
 

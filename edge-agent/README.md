@@ -18,7 +18,7 @@ Specifically, it:
 - Runs a lightweight **edge agent**
 - Executes workloads based on the **last known desired state**
 - Continues operating even when the control plane is unavailable
-- Maintains local runtime state
+- Maintains local runtime state in `state.json`
 - Enforces local safety constraints (CPU, memory, basic sanity checks)
 - Initiates all communication with the control plane (pull-based)
 

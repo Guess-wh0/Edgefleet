@@ -1,6 +1,8 @@
 package main
 
 import (
+	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net/http"
@@ -12,19 +14,106 @@ import (
 )
 
 const controlPlaneBase = "http://localhost:8080"
+const stateFileName = "state.json"
 
-var nodeIDFile = ""
+var stateFile = ""
 
-func loadNodeID() string {
-	data, err := os.ReadFile(nodeIDFile)
+type DesiredState struct {
+	Version int    `json:"version"`
+	Payload string `json:"payload"`
+}
+
+type PersistentState struct {
+	NodeID             string `json:"node_id"`
+	LastAppliedVersion int    `json:"last_applied_desired_state_version"`
+}
+
+func loadPersistentState() PersistentState {
+	data, err := os.ReadFile(stateFile)
+	if err == nil {
+		var state PersistentState
+		if err := json.Unmarshal(data, &state); err != nil {
+			log.Printf("state file unreadable: %v", err)
+			return PersistentState{}
+		}
+		return state
+	}
+
+	if !errors.Is(err, os.ErrNotExist) {
+		log.Printf("state file read error: %v", err)
+		return PersistentState{}
+	}
+
+	return migrateLegacyState()
+}
+
+func savePersistentState(state PersistentState) {
+	data, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		log.Printf("state marshal error: %v", err)
+		return
+	}
+
+	tempFile := stateFile + ".tmp"
+	data = append(data, '\n')
+
+	if err := os.WriteFile(tempFile, data, 0644); err != nil {
+		log.Printf("state write error: %v", err)
+		return
+	}
+
+	if err := os.Rename(tempFile, stateFile); err != nil {
+		_ = os.Remove(stateFile)
+		if err := os.Rename(tempFile, stateFile); err != nil {
+			log.Printf("state replace error: %v", err)
+			_ = os.Remove(tempFile)
+		}
+	}
+}
+
+func migrateLegacyState() PersistentState {
+	state := PersistentState{
+		NodeID:             loadLegacyNodeID(),
+		LastAppliedVersion: loadLegacyAppliedVersion(),
+	}
+
+	if state.NodeID == "" && state.LastAppliedVersion == 0 {
+		return PersistentState{}
+	}
+
+	savePersistentState(state)
+	log.Printf("[STATE] migrated legacy local state into %s", stateFileName)
+
+	return state
+}
+
+func loadLegacyNodeID() string {
+	data, err := os.ReadFile(filepath.Join(filepath.Dir(stateFile), "node_id.txt"))
 	if err != nil {
 		return ""
 	}
 	return strings.TrimSpace(string(data))
 }
 
-func saveNodeID(id string) {
-	_ = os.WriteFile(nodeIDFile, []byte(id), 0644)
+func loadLegacyAppliedVersion() int {
+	candidates := []string{
+		filepath.Join(filepath.Dir(stateFile), "applied_version.txt"),
+		"applied_version.txt",
+	}
+
+	for _, candidate := range candidates {
+		data, err := os.ReadFile(candidate)
+		if err != nil {
+			continue
+		}
+
+		v, err := strconv.Atoi(strings.TrimSpace(string(data)))
+		if err == nil {
+			return v
+		}
+	}
+
+	return 0
 }
 
 func registerNode() string {
@@ -46,7 +135,7 @@ func registerNode() string {
 	body, _ := io.ReadAll(resp.Body)
 	nodeID := strings.TrimSpace(string(body))
 
-	saveNodeID(nodeID)
+	savePersistentState(PersistentState{NodeID: nodeID})
 	log.Println("Registered node:", nodeID)
 
 	return nodeID
@@ -90,19 +179,72 @@ func getenvInt(key string, def int) int {
 	return i
 }
 
+func fetchDesiredState(nodeID string) (*DesiredState, error) {
+	url := controlPlaneBase + "/desired-state/" + nodeID
+
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if len(body) == 0 {
+		return nil, nil
+	}
+
+	var ds DesiredState
+	err = json.Unmarshal(body, &ds)
+	if err != nil {
+		return nil, err
+	}
+	log.Printf("[fetched_state] version=%d",
+		ds.Version)
+	return &ds, nil
+}
+
+func reconcile(state *PersistentState) {
+	ds, err := fetchDesiredState(state.NodeID)
+	if err != nil {
+		log.Println("fetch error:", err)
+		return
+	}
+
+	if ds == nil {
+		return
+	}
+
+	if ds.Version <= state.LastAppliedVersion {
+		log.Printf("[RECONCILE] stale/replay version=%d (last=%d)",
+			ds.Version, state.LastAppliedVersion)
+		return
+	}
+
+	// Persist only after a newer desired state is accepted locally.
+	log.Printf("[RECONCILE] applying version=%d payload=%s",
+		ds.Version, ds.Payload)
+
+	// TODO: actual execution later
+
+	state.LastAppliedVersion = ds.Version
+	savePersistentState(*state)
+}
+
 func main() {
 	// connectWiFi() // platform-specific: implemented on Pico (TinyGo)
 	nodeDir := getenv("EDGE_NODE_DIR", ".")
 	_ = os.MkdirAll(nodeDir, 0755)
-	nodeIDFile = filepath.Join(nodeDir, "node_id.txt")
-	nodeID := loadNodeID()
-	if nodeID == "" {
-		nodeID = registerNode()
+	stateFile = filepath.Join(nodeDir, stateFileName)
+
+	state := loadPersistentState()
+	if state.NodeID == "" {
+		state.NodeID = registerNode()
 	}
 
 	for {
 		heartbeatEvery := time.Duration(getenvInt("EDGE_HEARTBEAT_SEC", 10)) * time.Second
-		sendHeartbeat(nodeID)
+		sendHeartbeat(state.NodeID)
+		reconcile(&state)
 		time.Sleep(heartbeatEvery)
 	}
 }
