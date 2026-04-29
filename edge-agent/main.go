@@ -13,7 +13,8 @@ import (
 	"time"
 )
 
-const controlPlaneBase = "http://localhost:8080"
+var controlPlaneBase = "http://localhost:8080"
+
 const stateFileName = "state.json"
 
 var stateFile = ""
@@ -136,7 +137,7 @@ func registerNode() string {
 	nodeID := strings.TrimSpace(string(body))
 
 	savePersistentState(PersistentState{NodeID: nodeID})
-	log.Println("Registered node:", nodeID)
+	log.Printf("[REGISTER] node=%s", nodeID)
 
 	return nodeID
 }
@@ -156,7 +157,7 @@ func sendHeartbeat(nodeID string) {
 	}
 	resp.Body.Close()
 
-	log.Println("heartbeat sent")
+	log.Printf("[HEARTBEAT] sent node=%s", nodeID)
 }
 
 func getenv(key, def string) string {
@@ -214,9 +215,12 @@ func reconcile(state *PersistentState) {
 		return
 	}
 
-	if ds.Version <= state.LastAppliedVersion {
+	if ds.Version < state.LastAppliedVersion {
 		log.Printf("[RECONCILE] stale/replay version=%d (last=%d)",
 			ds.Version, state.LastAppliedVersion)
+		return
+	}
+	if ds.Version == state.LastAppliedVersion {
 		return
 	}
 
@@ -230,21 +234,36 @@ func reconcile(state *PersistentState) {
 	savePersistentState(*state)
 }
 
-func main() {
-	// connectWiFi() // platform-specific: implemented on Pico (TinyGo)
-	nodeDir := getenv("EDGE_NODE_DIR", ".")
+func initializeLocalState(nodeDir string) PersistentState {
 	_ = os.MkdirAll(nodeDir, 0755)
 	stateFile = filepath.Join(nodeDir, stateFileName)
 
 	state := loadPersistentState()
 	if state.NodeID == "" {
 		state.NodeID = registerNode()
+		return state
 	}
+
+	log.Printf("[STATE] restored node=%s last_applied=%d",
+		state.NodeID,
+		state.LastAppliedVersion,
+	)
+	return state
+}
+
+func runOnce(state *PersistentState) {
+	sendHeartbeat(state.NodeID)
+	reconcile(state)
+}
+
+func main() {
+	// connectWiFi() // platform-specific: implemented on Pico (TinyGo)
+	nodeDir := getenv("EDGE_NODE_DIR", ".")
+	state := initializeLocalState(nodeDir)
 
 	for {
 		heartbeatEvery := time.Duration(getenvInt("EDGE_HEARTBEAT_SEC", 10)) * time.Second
-		sendHeartbeat(state.NodeID)
-		reconcile(&state)
+		runOnce(&state)
 		time.Sleep(heartbeatEvery)
 	}
 }

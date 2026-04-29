@@ -1,10 +1,76 @@
 package main
 
 import (
+	"bytes"
+	"log"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 )
+
+type fakeControlPlane struct {
+	mu             sync.Mutex
+	nodeID         string
+	registerCount  int
+	heartbeatNodes []string
+	desiredBody    string
+}
+
+func newFakeControlPlane(t *testing.T, desiredBody string) (*fakeControlPlane, *httptest.Server) {
+	t.Helper()
+
+	cp := &fakeControlPlane{
+		nodeID:      "node-1",
+		desiredBody: desiredBody,
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/register", func(w http.ResponseWriter, r *http.Request) {
+		cp.mu.Lock()
+		defer cp.mu.Unlock()
+
+		cp.registerCount++
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(cp.nodeID))
+	})
+
+	mux.HandleFunc("/heartbeat", func(w http.ResponseWriter, r *http.Request) {
+		cp.mu.Lock()
+		defer cp.mu.Unlock()
+
+		nodeID := r.Header.Get("X-Node-ID")
+		cp.heartbeatNodes = append(cp.heartbeatNodes, nodeID)
+		if nodeID != cp.nodeID {
+			http.Error(w, "unknown node", http.StatusBadRequest)
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ack"))
+	})
+
+	mux.HandleFunc("/desired-state/", func(w http.ResponseWriter, r *http.Request) {
+		cp.mu.Lock()
+		defer cp.mu.Unlock()
+
+		nodeID := strings.TrimPrefix(r.URL.Path, "/desired-state/")
+		if nodeID != cp.nodeID {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(cp.desiredBody))
+	})
+
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+	return cp, server
+}
 
 func withStateFile(t *testing.T, path string) {
 	t.Helper()
@@ -14,6 +80,34 @@ func withStateFile(t *testing.T, path string) {
 	t.Cleanup(func() {
 		stateFile = previous
 	})
+}
+
+func withControlPlaneBase(t *testing.T, base string) {
+	t.Helper()
+
+	previous := controlPlaneBase
+	controlPlaneBase = base
+	t.Cleanup(func() {
+		controlPlaneBase = previous
+	})
+}
+
+func withLogBuffer(t *testing.T) *bytes.Buffer {
+	t.Helper()
+
+	var buffer bytes.Buffer
+	previousWriter := log.Writer()
+	previousFlags := log.Flags()
+
+	log.SetOutput(&buffer)
+	log.SetFlags(0)
+
+	t.Cleanup(func() {
+		log.SetOutput(previousWriter)
+		log.SetFlags(previousFlags)
+	})
+
+	return &buffer
 }
 
 func TestSaveAndLoadPersistentState(t *testing.T) {
@@ -79,5 +173,84 @@ func TestLoadPersistentStatePrefersJSONState(t *testing.T) {
 	}
 	if state.LastAppliedVersion != 21 {
 		t.Fatalf("expected JSON version 21, got %d", state.LastAppliedVersion)
+	}
+}
+
+func TestEdgeRestartReusesNodeIDAndReconcilesIdempotently(t *testing.T) {
+	tempDir := t.TempDir()
+	logBuffer := withLogBuffer(t)
+
+	cp, server := newFakeControlPlane(t, `{"version":4,"payload":"restart-drill"}`)
+	withControlPlaneBase(t, server.URL)
+
+	firstStart := initializeLocalState(tempDir)
+	if firstStart.NodeID != "node-1" {
+		t.Fatalf("first start node id = %q, want %q", firstStart.NodeID, "node-1")
+	}
+
+	runOnce(&firstStart)
+
+	persistedAfterFirstStart := loadPersistentState()
+	if persistedAfterFirstStart.NodeID != "node-1" {
+		t.Fatalf("persisted node id after first start = %q, want %q", persistedAfterFirstStart.NodeID, "node-1")
+	}
+	if persistedAfterFirstStart.LastAppliedVersion != 4 {
+		t.Fatalf("persisted version after first start = %d, want %d", persistedAfterFirstStart.LastAppliedVersion, 4)
+	}
+
+	firstLogs := logBuffer.String()
+	if !strings.Contains(firstLogs, "[REGISTER] node=node-1") {
+		t.Fatalf("first start logs should include registration, got %q", firstLogs)
+	}
+	if !strings.Contains(firstLogs, "[RECONCILE] applying version=4 payload=restart-drill") {
+		t.Fatalf("first start logs should include apply, got %q", firstLogs)
+	}
+
+	logBuffer.Reset()
+
+	secondStart := initializeLocalState(tempDir)
+	if secondStart.NodeID != firstStart.NodeID {
+		t.Fatalf("restart node id = %q, want %q", secondStart.NodeID, firstStart.NodeID)
+	}
+
+	runOnce(&secondStart)
+
+	cp.mu.Lock()
+	registerCount := cp.registerCount
+	heartbeatNodes := append([]string(nil), cp.heartbeatNodes...)
+	cp.mu.Unlock()
+
+	if registerCount != 1 {
+		t.Fatalf("register count = %d, want %d", registerCount, 1)
+	}
+	if len(heartbeatNodes) != 2 {
+		t.Fatalf("heartbeat count = %d, want %d", len(heartbeatNodes), 2)
+	}
+	for _, nodeID := range heartbeatNodes {
+		if nodeID != "node-1" {
+			t.Fatalf("heartbeat used node id %q, want %q", nodeID, "node-1")
+		}
+	}
+
+	persistedAfterRestart := loadPersistentState()
+	if persistedAfterRestart.NodeID != "node-1" {
+		t.Fatalf("persisted node id after restart = %q, want %q", persistedAfterRestart.NodeID, "node-1")
+	}
+	if persistedAfterRestart.LastAppliedVersion != 4 {
+		t.Fatalf("persisted version after restart = %d, want %d", persistedAfterRestart.LastAppliedVersion, 4)
+	}
+
+	secondLogs := logBuffer.String()
+	if !strings.Contains(secondLogs, "[STATE] restored node=node-1 last_applied=4") {
+		t.Fatalf("restart logs should include restored state, got %q", secondLogs)
+	}
+	if strings.Contains(secondLogs, "[REGISTER]") {
+		t.Fatalf("restart logs should not register again, got %q", secondLogs)
+	}
+	if strings.Contains(secondLogs, "stale/replay") {
+		t.Fatalf("restart logs should not report replay for same version, got %q", secondLogs)
+	}
+	if strings.Contains(secondLogs, "[RECONCILE] applying") {
+		t.Fatalf("restart logs should not reapply same version, got %q", secondLogs)
 	}
 }

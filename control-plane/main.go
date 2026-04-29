@@ -58,8 +58,7 @@ func nodeIdMissing(w http.ResponseWriter, nodeID string) bool {
 	return false
 }
 
-// Phase 1: heartbeat updates liveness metadata only.
-// No scheduling or reconciliation is triggered.
+// heartbeat updates liveness metadata only.
 func heartbeatHandler(w http.ResponseWriter, r *http.Request) {
 	if !requireMethod(w, r, http.MethodPost) {
 		return
