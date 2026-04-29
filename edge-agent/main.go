@@ -216,15 +216,18 @@ func reconcile(state *PersistentState) {
 	}
 
 	if ds.Version < state.LastAppliedVersion {
-		log.Printf("[RECONCILE] stale/replay version=%d (last=%d)",
+		log.Printf("[RECONCILE] compare remote=%d local=%d result=stale",
 			ds.Version, state.LastAppliedVersion)
 		return
 	}
 	if ds.Version == state.LastAppliedVersion {
+		log.Printf("[RECONCILE] compare remote=%d local=%d result=in-sync",
+			ds.Version, state.LastAppliedVersion)
 		return
 	}
 
-	// Persist only after a newer desired state is accepted locally.
+	log.Printf("[RECONCILE] compare remote=%d local=%d result=drift",
+		ds.Version, state.LastAppliedVersion)
 	log.Printf("[RECONCILE] applying version=%d payload=%s",
 		ds.Version, ds.Payload)
 
@@ -232,6 +235,7 @@ func reconcile(state *PersistentState) {
 
 	state.LastAppliedVersion = ds.Version
 	savePersistentState(*state)
+	log.Printf("[RECONCILE] success version=%d", ds.Version)
 }
 
 func initializeLocalState(nodeDir string) PersistentState {

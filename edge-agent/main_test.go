@@ -110,6 +110,10 @@ func withLogBuffer(t *testing.T) *bytes.Buffer {
 	return &buffer
 }
 
+func countOccurrences(haystack, needle string) int {
+	return strings.Count(haystack, needle)
+}
+
 func TestSaveAndLoadPersistentState(t *testing.T) {
 	tempDir := t.TempDir()
 	withStateFile(t, filepath.Join(tempDir, stateFileName))
@@ -252,5 +256,80 @@ func TestEdgeRestartReusesNodeIDAndReconcilesIdempotently(t *testing.T) {
 	}
 	if strings.Contains(secondLogs, "[RECONCILE] applying") {
 		t.Fatalf("restart logs should not reapply same version, got %q", secondLogs)
+	}
+	if !strings.Contains(secondLogs, "[RECONCILE] compare remote=4 local=4 result=in-sync") {
+		t.Fatalf("restart logs should show in-sync comparison, got %q", secondLogs)
+	}
+}
+
+func TestEdgeRestartDetectsDriftAndAppliesUpdatedDesiredStateOnce(t *testing.T) {
+	tempDir := t.TempDir()
+	logBuffer := withLogBuffer(t)
+
+	cp, server := newFakeControlPlane(t, `{"version":4,"payload":"before-offline"}`)
+	withControlPlaneBase(t, server.URL)
+
+	firstStart := initializeLocalState(tempDir)
+	runOnce(&firstStart)
+
+	firstLogs := logBuffer.String()
+	if !strings.Contains(firstLogs, "[RECONCILE] compare remote=4 local=0 result=drift") {
+		t.Fatalf("first start should detect initial drift, got %q", firstLogs)
+	}
+	if !strings.Contains(firstLogs, "[RECONCILE] success version=4") {
+		t.Fatalf("first start should report successful apply, got %q", firstLogs)
+	}
+
+	cp.mu.Lock()
+	cp.desiredBody = `{"version":5,"payload":"after-offline"}`
+	cp.mu.Unlock()
+
+	logBuffer.Reset()
+
+	secondStart := initializeLocalState(tempDir)
+	if secondStart.NodeID != "node-1" {
+		t.Fatalf("restart node id = %q, want %q", secondStart.NodeID, "node-1")
+	}
+	if secondStart.LastAppliedVersion != 4 {
+		t.Fatalf("restart local version = %d, want %d", secondStart.LastAppliedVersion, 4)
+	}
+
+	runOnce(&secondStart)
+
+	cp.mu.Lock()
+	registerCount := cp.registerCount
+	heartbeatNodes := append([]string(nil), cp.heartbeatNodes...)
+	cp.mu.Unlock()
+
+	if registerCount != 1 {
+		t.Fatalf("register count after drift restart = %d, want %d", registerCount, 1)
+	}
+	if len(heartbeatNodes) != 2 {
+		t.Fatalf("heartbeat count after drift restart = %d, want %d", len(heartbeatNodes), 2)
+	}
+
+	persisted := loadPersistentState()
+	if persisted.NodeID != "node-1" {
+		t.Fatalf("persisted node id after drift restart = %q, want %q", persisted.NodeID, "node-1")
+	}
+	if persisted.LastAppliedVersion != 5 {
+		t.Fatalf("persisted version after drift restart = %d, want %d", persisted.LastAppliedVersion, 5)
+	}
+
+	secondLogs := logBuffer.String()
+	if !strings.Contains(secondLogs, "[STATE] restored node=node-1 last_applied=4") {
+		t.Fatalf("restart logs should include restored state, got %q", secondLogs)
+	}
+	if !strings.Contains(secondLogs, "[RECONCILE] compare remote=5 local=4 result=drift") {
+		t.Fatalf("restart logs should detect drift, got %q", secondLogs)
+	}
+	if countOccurrences(secondLogs, "[RECONCILE] applying version=5 payload=after-offline") != 1 {
+		t.Fatalf("restart logs should apply updated version exactly once, got %q", secondLogs)
+	}
+	if !strings.Contains(secondLogs, "[RECONCILE] success version=5") {
+		t.Fatalf("restart logs should report successful apply, got %q", secondLogs)
+	}
+	if strings.Contains(secondLogs, "[REGISTER]") {
+		t.Fatalf("restart logs should not register again, got %q", secondLogs)
 	}
 }
