@@ -3,8 +3,10 @@ package main
 import (
 	"database/sql"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/google/uuid"
@@ -56,8 +58,7 @@ func nodeIdMissing(w http.ResponseWriter, nodeID string) bool {
 	return false
 }
 
-// Phase 1: heartbeat updates liveness metadata only.
-// No scheduling or reconciliation is triggered.
+// heartbeat updates liveness metadata only.
 func heartbeatHandler(w http.ResponseWriter, r *http.Request) {
 	if !requireMethod(w, r, http.MethodPost) {
 		return
@@ -135,16 +136,34 @@ func getDesiredState(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("[DESIRED_STATE_FETCH] node=%s time=%s",
+	var version int
+	var payload string
+
+	err := db.QueryRow(`
+		SELECT version, payload
+		FROM desired_state
+		WHERE node_id = ?
+	`, nodeID).Scan(&version, &payload)
+
+	if err == sql.ErrNoRows {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(""))
+		return
+	}
+
+	if err != nil {
+		http.Error(w, "error fetching desired state", http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("[DESIRED_STATE_FETCH] node=%s version=%d time=%s",
 		nodeID,
+		version,
 		time.Now().Format(time.RFC3339),
 	)
 
-	//WIP: Add code to fetch node data from SQLite using nodeID
-	// then compute the desired state in later phase. Currently we are returning empty string
-
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(""))
+	w.Write([]byte(payload))
 }
 
 func getHealthDetail(w http.ResponseWriter, r *http.Request) {
@@ -180,6 +199,10 @@ func initDB() error {
 		return err
 	}
 
+	// Enable WAL mode for better concurrency
+	_, _ = db.Exec(`PRAGMA journal_mode=WAL;`)
+
+	// Nodes table
 	_, err = db.Exec(`
 	CREATE TABLE IF NOT EXISTS nodes (
 		node_id TEXT PRIMARY KEY,
@@ -189,6 +212,35 @@ func initDB() error {
 		arch TEXT
 	)
 	`)
+
+	if err != nil {
+		return err
+	}
+
+	// Desired state table
+	_, err = db.Exec(`
+	CREATE TABLE IF NOT EXISTS desired_state (
+		node_id TEXT PRIMARY KEY,
+		version INTEGER,
+		payload TEXT
+	)
+	`)
+	if err != nil {
+		return err
+	}
+	return err
+}
+
+func upsertDesiredState(nodeID string, version int, payload string) error {
+	_, err := db.Exec(`
+		INSERT INTO desired_state (node_id, version, payload)
+		VALUES (?, ?, ?)
+		ON CONFLICT(node_id)
+		DO UPDATE SET
+			version = excluded.version,
+			payload = excluded.payload
+		`, nodeID, version, payload)
+
 	return err
 }
 
@@ -258,6 +310,37 @@ func listNodes(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// for development stress testing only
+func setDesiredState(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodPost) {
+		return
+	}
+
+	nodeID := r.URL.Query().Get("nodeID")
+	if nodeID == "" {
+		http.Error(w, "missing nodeID", http.StatusBadRequest)
+		return
+	}
+
+	versionStr := r.URL.Query().Get("version")
+	payloadBytes, _ := io.ReadAll(r.Body)
+
+	version, _ := strconv.Atoi(versionStr)
+
+	err := upsertDesiredState(nodeID, version, string(payloadBytes))
+	if err != nil {
+		http.Error(w, "failed to set desired state", http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("[DESIRED_STATE_SET][%s] version=%d",
+		nodeID,
+		version,
+	)
+
+	w.WriteHeader(http.StatusOK)
+}
+
 func main() {
 
 	if err := initDB(); err != nil {
@@ -272,6 +355,7 @@ func main() {
 	mux.HandleFunc("/desired-state/{nodeID}", getDesiredState)
 	mux.HandleFunc("/health", getHealthDetail)
 	mux.HandleFunc("/nodes", listNodes)
+	mux.HandleFunc("/debug/set-desired", setDesiredState)
 
 	addr := ":8080"
 	log.Println("Control Plane starting on", addr)
