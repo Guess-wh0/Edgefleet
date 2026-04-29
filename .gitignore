@@ -2,6 +2,9 @@
 go.sum
 *.db
 edge-agent/node*/
+edge-agent/*/state.json
+edge-agent/*/node_id.txt
+edge-agent/*/applied_version.txt
 *.exe
 *.db-shm
 *db-wal
