@@ -1,7 +1,10 @@
 package main
 
 import (
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -20,6 +23,7 @@ var db *sql.DB
 const (
 	errMethodNotAllowed = "method not allowed"
 	errMissingNodeID    = "missing node id"
+	errMissingNodeToken = "missing node token"
 )
 
 const (
@@ -33,6 +37,11 @@ type Node struct {
 	NodeId        string `json:"node_id"`
 	LastHeartbeat string `json:"last_heartbeat"`
 	Status        string `json:"status"`
+}
+
+type RegistrationResponse struct {
+	NodeID     string `json:"node_id"`
+	NodeSecret string `json:"node_secret"`
 }
 
 // Helper method to validate request method
@@ -58,13 +67,62 @@ func nodeIdMissing(w http.ResponseWriter, nodeID string) bool {
 	return false
 }
 
+func nodeTokenMissing(w http.ResponseWriter, nodeToken string) bool {
+	if nodeToken == "" {
+		http.Error(w, errMissingNodeToken, http.StatusUnauthorized)
+		return true
+	}
+	return false
+}
+
+func generateNodeSecret() (string, error) {
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(buf), nil
+}
+
+func authenticateNodeRequest(w http.ResponseWriter, r *http.Request, expectedNodeID string) bool {
+	nodeID := r.Header.Get("X-Node-ID")
+	if nodeIdMissing(w, nodeID) {
+		return false
+	}
+	if expectedNodeID != "" && nodeID != expectedNodeID {
+		http.Error(w, "node id mismatch", http.StatusUnauthorized)
+		return false
+	}
+
+	nodeToken := r.Header.Get("X-Node-Token")
+	if nodeTokenMissing(w, nodeToken) {
+		return false
+	}
+
+	var storedToken string
+	err := db.QueryRow(`SELECT node_secret FROM nodes WHERE node_id = ?`, nodeID).Scan(&storedToken)
+	if err == sql.ErrNoRows {
+		http.Error(w, "unknown node", http.StatusUnauthorized)
+		return false
+	}
+	if err != nil {
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return false
+	}
+	if storedToken == "" || storedToken != nodeToken {
+		http.Error(w, "invalid node token", http.StatusUnauthorized)
+		return false
+	}
+
+	return true
+}
+
 // heartbeat updates liveness metadata only.
 func heartbeatHandler(w http.ResponseWriter, r *http.Request) {
 	if !requireMethod(w, r, http.MethodPost) {
 		return
 	}
 	nodeID := r.Header.Get("X-Node-ID")
-	if nodeIdMissing(w, nodeID) {
+	if !authenticateNodeRequest(w, r, nodeID) {
 		return
 	}
 	res, err := db.Exec(
@@ -97,14 +155,20 @@ func registrationHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	nodeID := uuid.New().String()
+	nodeSecret, err := generateNodeSecret()
+	if err != nil {
+		http.Error(w, "failed to generate node secret", http.StatusInternalServerError)
+		return
+	}
 
 	hostname := r.Header.Get("X-Node-Hostname")
 	arch := r.Header.Get("X-Node-Arch")
 
-	_, err := db.Exec(
-		`INSERT INTO nodes (node_id, last_heartbeat, status, hostname, arch)
-		VALUES (?, ?, ?, ?, ?)`,
+	_, err = db.Exec(
+		`INSERT INTO nodes (node_id, node_secret, last_heartbeat, status, hostname, arch)
+		VALUES (?, ?, ?, ?, ?, ?)`,
 		nodeID,
+		nodeSecret,
 		time.Now().UTC(),
 		"registered",
 		hostname,
@@ -122,8 +186,12 @@ func registrationHandler(w http.ResponseWriter, r *http.Request) {
 		time.Now().Format(time.RFC3339),
 	)
 
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(nodeID))
+	_ = json.NewEncoder(w).Encode(RegistrationResponse{
+		NodeID:     nodeID,
+		NodeSecret: nodeSecret,
+	})
 }
 
 func getDesiredState(w http.ResponseWriter, r *http.Request) {
@@ -133,6 +201,9 @@ func getDesiredState(w http.ResponseWriter, r *http.Request) {
 
 	nodeID := r.PathValue("nodeID")
 	if nodeIdMissing(w, nodeID) {
+		return
+	}
+	if !authenticateNodeRequest(w, r, nodeID) {
 		return
 	}
 
@@ -206,6 +277,7 @@ func initDB() error {
 	_, err = db.Exec(`
 	CREATE TABLE IF NOT EXISTS nodes (
 		node_id TEXT PRIMARY KEY,
+		node_secret TEXT,
 		last_heartbeat TIMESTAMP,
 		status TEXT,
 		hostname TEXT,
@@ -214,6 +286,9 @@ func initDB() error {
 	`)
 
 	if err != nil {
+		return err
+	}
+	if err := ensureNodeSecretColumn(); err != nil {
 		return err
 	}
 
@@ -228,6 +303,33 @@ func initDB() error {
 	if err != nil {
 		return err
 	}
+	return err
+}
+
+func ensureNodeSecretColumn() error {
+	rows, err := db.Query(`PRAGMA table_info(nodes)`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var cid int
+		var name string
+		var dataType string
+		var notNull int
+		var defaultValue any
+		var pk int
+
+		if err := rows.Scan(&cid, &name, &dataType, &notNull, &defaultValue, &pk); err != nil {
+			return err
+		}
+		if name == "node_secret" {
+			return nil
+		}
+	}
+
+	_, err = db.Exec(`ALTER TABLE nodes ADD COLUMN node_secret TEXT`)
 	return err
 }
 

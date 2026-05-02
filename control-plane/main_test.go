@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -73,10 +74,14 @@ func TestControlPlaneRestartPreservesDesiredStateAndHeartbeat(t *testing.T) {
 	if registerResp.Code != http.StatusOK {
 		t.Fatalf("register status = %d, want %d", registerResp.Code, http.StatusOK)
 	}
-	nodeID := strings.TrimSpace(registerResp.Body.String())
-	if nodeID == "" {
-		t.Fatal("register returned empty node id")
+	var registration RegistrationResponse
+	if err := json.Unmarshal(registerResp.Body.Bytes(), &registration); err != nil {
+		t.Fatalf("decode register response: %v", err)
 	}
+	if registration.NodeID == "" || registration.NodeSecret == "" {
+		t.Fatal("register returned incomplete node identity")
+	}
+	nodeID := registration.NodeID
 
 	desiredPayload := `{"version":3,"payload":"restart-drill"}`
 	setDesiredResp := performRequest(
@@ -102,7 +107,8 @@ func TestControlPlaneRestartPreservesDesiredStateAndHeartbeat(t *testing.T) {
 	mux = testMux()
 
 	heartbeatResp := performRequest(t, mux, http.MethodPost, "/heartbeat", "", map[string]string{
-		"X-Node-ID": nodeID,
+		"X-Node-ID":    nodeID,
+		"X-Node-Token": registration.NodeSecret,
 	})
 	if heartbeatResp.Code != http.StatusOK {
 		t.Fatalf("heartbeat after restart status = %d, want %d", heartbeatResp.Code, http.StatusOK)
@@ -111,7 +117,10 @@ func TestControlPlaneRestartPreservesDesiredStateAndHeartbeat(t *testing.T) {
 		t.Fatalf("heartbeat after restart body = %q, want %q", heartbeatResp.Body.String(), "ack")
 	}
 
-	desiredResp := performRequest(t, mux, http.MethodGet, "/desired-state/"+nodeID, "", nil)
+	desiredResp := performRequest(t, mux, http.MethodGet, "/desired-state/"+nodeID, "", map[string]string{
+		"X-Node-ID":    nodeID,
+		"X-Node-Token": registration.NodeSecret,
+	})
 	if desiredResp.Code != http.StatusOK {
 		t.Fatalf("desired state fetch status = %d, want %d", desiredResp.Code, http.StatusOK)
 	}
@@ -203,7 +212,85 @@ func TestGetDesiredStateAfterRestartReturnsBody(t *testing.T) {
 	}
 
 	mux := testMux()
-	resp := performRequest(t, mux, http.MethodGet, "/desired-state/"+nodeID, "", nil)
+	resp := performRequest(t, mux, http.MethodGet, "/desired-state/"+nodeID, "", map[string]string{
+		"X-Node-ID":    nodeID,
+		"X-Node-Token": "wrong-token",
+	})
+	if resp.Code != http.StatusUnauthorized {
+		t.Fatalf("desired state status = %d, want %d", resp.Code, http.StatusUnauthorized)
+	}
+}
+
+func TestHeartbeatRejectsMissingNodeToken(t *testing.T) {
+	withTempWorkingDir(t)
+
+	if err := initDB(); err != nil {
+		t.Fatalf("init db: %v", err)
+	}
+	mux := testMux()
+
+	registerResp := performRequest(t, mux, http.MethodPost, "/register", "", map[string]string{
+		"X-Node-Hostname": "auth-node",
+		"X-Node-Arch":     "amd64",
+	})
+	if registerResp.Code != http.StatusOK {
+		t.Fatalf("register status = %d, want %d", registerResp.Code, http.StatusOK)
+	}
+
+	var registration RegistrationResponse
+	if err := json.Unmarshal(registerResp.Body.Bytes(), &registration); err != nil {
+		t.Fatalf("decode register response: %v", err)
+	}
+
+	resp := performRequest(t, mux, http.MethodPost, "/heartbeat", "", map[string]string{
+		"X-Node-ID": registration.NodeID,
+	})
+	if resp.Code != http.StatusUnauthorized {
+		t.Fatalf("heartbeat status = %d, want %d", resp.Code, http.StatusUnauthorized)
+	}
+}
+
+func TestDesiredStateAcceptsValidNodeToken(t *testing.T) {
+	withTempWorkingDir(t)
+
+	if err := initDB(); err != nil {
+		t.Fatalf("init db first open: %v", err)
+	}
+
+	registerMux := testMux()
+	registerResp := performRequest(t, registerMux, http.MethodPost, "/register", "", map[string]string{
+		"X-Node-Hostname": "node-handler",
+		"X-Node-Arch":     "amd64",
+	})
+	if registerResp.Code != http.StatusOK {
+		t.Fatalf("register status = %d, want %d", registerResp.Code, http.StatusOK)
+	}
+
+	var registration RegistrationResponse
+	if err := json.Unmarshal(registerResp.Body.Bytes(), &registration); err != nil {
+		t.Fatalf("decode register response: %v", err)
+	}
+
+	const desiredPayload = `{"version":4,"payload":"handler-check"}`
+
+	if err := upsertDesiredState(registration.NodeID, 4, desiredPayload); err != nil {
+		t.Fatalf("upsert desired state: %v", err)
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+	db = nil
+
+	if err := initDB(); err != nil {
+		t.Fatalf("reopen db: %v", err)
+	}
+
+	mux := testMux()
+	resp := performRequest(t, mux, http.MethodGet, "/desired-state/"+registration.NodeID, "", map[string]string{
+		"X-Node-ID":    registration.NodeID,
+		"X-Node-Token": registration.NodeSecret,
+	})
 	if resp.Code != http.StatusOK {
 		t.Fatalf("desired state status = %d, want %d", resp.Code, http.StatusOK)
 	}

@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -24,8 +25,14 @@ type DesiredState struct {
 	Payload string `json:"payload"`
 }
 
+type RegistrationResponse struct {
+	NodeID     string `json:"node_id"`
+	NodeSecret string `json:"node_secret"`
+}
+
 type PersistentState struct {
 	NodeID             string `json:"node_id"`
+	NodeSecret         string `json:"node_secret"`
 	LastAppliedVersion int    `json:"last_applied_desired_state_version"`
 }
 
@@ -117,7 +124,7 @@ func loadLegacyAppliedVersion() int {
 	return 0
 }
 
-func registerNode() string {
+func registerNode() PersistentState {
 	req, _ := http.NewRequest(
 		"POST",
 		controlPlaneBase+"/register",
@@ -133,31 +140,47 @@ func registerNode() string {
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
-	nodeID := strings.TrimSpace(string(body))
+	var registration RegistrationResponse
+	if err := json.NewDecoder(resp.Body).Decode(&registration); err != nil {
+		log.Fatal("registration decode failed:", err)
+	}
+	if registration.NodeID == "" || registration.NodeSecret == "" {
+		log.Fatal("registration returned incomplete node identity")
+	}
 
-	savePersistentState(PersistentState{NodeID: nodeID})
-	log.Printf("[REGISTER] node=%s", nodeID)
+	state := PersistentState{
+		NodeID:     registration.NodeID,
+		NodeSecret: registration.NodeSecret,
+	}
+	savePersistentState(state)
+	log.Printf("[REGISTER] node=%s", registration.NodeID)
 
-	return nodeID
+	return state
 }
 
-func sendHeartbeat(nodeID string) {
+func sendHeartbeat(state PersistentState) {
 	req, _ := http.NewRequest(
 		"POST",
 		controlPlaneBase+"/heartbeat",
 		nil,
 	)
-	req.Header.Set("X-Node-ID", nodeID)
+	req.Header.Set("X-Node-ID", state.NodeID)
+	req.Header.Set("X-Node-Token", state.NodeSecret)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		log.Println("heartbeat error:", err)
 		return
 	}
-	resp.Body.Close()
+	defer resp.Body.Close()
 
-	log.Printf("[HEARTBEAT] sent node=%s", nodeID)
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		log.Printf("heartbeat rejected: status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return
+	}
+
+	log.Printf("[HEARTBEAT] sent node=%s", state.NodeID)
 }
 
 func getenv(key, def string) string {
@@ -180,14 +203,22 @@ func getenvInt(key string, def int) int {
 	return i
 }
 
-func fetchDesiredState(nodeID string) (*DesiredState, error) {
-	url := controlPlaneBase + "/desired-state/" + nodeID
+func fetchDesiredState(state PersistentState) (*DesiredState, error) {
+	url := controlPlaneBase + "/desired-state/" + state.NodeID
 
-	resp, err := http.Get(url)
+	req, _ := http.NewRequest(http.MethodGet, url, nil)
+	req.Header.Set("X-Node-ID", state.NodeID)
+	req.Header.Set("X-Node-Token", state.NodeSecret)
+
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("desired state fetch failed: status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
 
 	body, _ := io.ReadAll(resp.Body)
 	if len(body) == 0 {
@@ -205,7 +236,7 @@ func fetchDesiredState(nodeID string) (*DesiredState, error) {
 }
 
 func reconcile(state *PersistentState) {
-	ds, err := fetchDesiredState(state.NodeID)
+	ds, err := fetchDesiredState(*state)
 	if err != nil {
 		log.Println("fetch error:", err)
 		return
@@ -244,8 +275,11 @@ func initializeLocalState(nodeDir string) PersistentState {
 
 	state := loadPersistentState()
 	if state.NodeID == "" {
-		state.NodeID = registerNode()
-		return state
+		return registerNode()
+	}
+	if state.NodeSecret == "" {
+		log.Printf("[STATE] missing node secret for node=%s; registering again", state.NodeID)
+		return registerNode()
 	}
 
 	log.Printf("[STATE] restored node=%s last_applied=%d",
@@ -256,7 +290,7 @@ func initializeLocalState(nodeDir string) PersistentState {
 }
 
 func runOnce(state *PersistentState) {
-	sendHeartbeat(state.NodeID)
+	sendHeartbeat(*state)
 	reconcile(state)
 }
 
