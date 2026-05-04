@@ -5,7 +5,7 @@
 EdgeFleet is a lightweight edge orchestration system designed around a simple truth:
 **the control plane may be fragile, but the edge must never be.**
 
-This project focuses on first principles of edge systems—explicit failure handling, pull-based control, and deterministic behavior—without hiding behind heavyweight platforms.
+This project focuses on first principles of edge systems: explicit failure handling, pull-based control, and deterministic behavior without hiding behind heavyweight platforms.
 
 ---
 
@@ -35,7 +35,7 @@ No magic. No guesswork.
 - **Explicit failure model**: all failure behavior is written down
 - **Deterministic reconciliation**: no heuristics, no surprises
 
-If behavior isn’t documented, it doesn’t exist.
+If behavior is not documented, it does not exist.
 
 ---
 
@@ -45,7 +45,7 @@ If behavior isn’t documented, it doesn’t exist.
   Runs workloads and maintains local execution state.
 
 - **Edge Agent**
-  Pulls desired state, applies it locally, and reports actual state.
+  Pulls desired state, applies it locally, authenticates itself to the control plane, and reports actual state.
 
 - **Control Plane**
   Computes desired state and observes the system.
@@ -72,28 +72,30 @@ Anything else is a bug.
 
 ## Project Status
 
-**Phase 3 — Robustness & Persistence**
+**Phase 4 - Security & Guardrails**
 
 Current state:
 - State storage in control plane
 - Edge restart reconciliation
 - Drift detection after downtime
 - Replay-safe reconciliation
+- Edge identity with `node_id` and `node_secret`
+- Token-authenticated edge requests
+- Basic Auth on control-plane user/admin endpoints
 
-Next phase will introduce:
-- Edge identity & registration
+Next work in this phase will introduce:
 - Signed desired state
-- Basic auth between edge and control plane
-- Rejection of untrusted commands
+- Stronger trust-boundary checks
+- Rejection of tampered control inputs
 
 ---
 
 ## Documentation
 
-- `docs/architecture.md` — system structure and responsibilities
-- `docs/principles.md` — non-negotiable design rules
-- `docs/failure-model.md` — what happens when things go wrong
-- `docs/phases.md` — development roadmap and phase discipline
+- `docs/architecture.md` - system structure and responsibilities
+- `docs/principles.md` - non-negotiable design rules
+- `docs/failure-model.md` - what happens when things go wrong
+- `docs/phases.md` - development roadmap and phase discipline
 
 Read these before writing or reviewing code.
 
@@ -125,4 +127,4 @@ EdgeFleet is built slowly on purpose.
 Correctness before scale.
 Clarity before features.
 
-If you’re here to understand edge systems deeply—you’re in the right place.
+If you are here to understand edge systems deeply, you are in the right place.

@@ -11,6 +11,11 @@ import (
 	"testing"
 )
 
+const (
+	testControlPlaneUser     = "admin"
+	testControlPlanePassword = "edgefleet"
+)
+
 func withTempWorkingDir(t *testing.T) {
 	t.Helper()
 
@@ -32,6 +37,20 @@ func withTempWorkingDir(t *testing.T) {
 		if err := os.Chdir(previous); err != nil {
 			t.Fatalf("restore workdir: %v", err)
 		}
+	})
+}
+
+func withControlPlaneBasicAuth(t *testing.T, username, password string) {
+	t.Helper()
+
+	previousUser := controlPlaneUser
+	previousPassword := controlPlanePassword
+	controlPlaneUser = username
+	controlPlanePassword = password
+
+	t.Cleanup(func() {
+		controlPlaneUser = previousUser
+		controlPlanePassword = previousPassword
 	})
 }
 
@@ -59,8 +78,20 @@ func performRequest(t *testing.T, mux *http.ServeMux, method, path string, body 
 	return rec
 }
 
+func authorizedHeaders(headers map[string]string) map[string]string {
+	if headers == nil {
+		headers = map[string]string{}
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.SetBasicAuth(testControlPlaneUser, testControlPlanePassword)
+	headers["Authorization"] = req.Header.Get("Authorization")
+	return headers
+}
+
 func TestControlPlaneRestartPreservesDesiredStateAndHeartbeat(t *testing.T) {
 	withTempWorkingDir(t)
+	withControlPlaneBasicAuth(t, testControlPlaneUser, testControlPlanePassword)
 
 	if err := initDB(); err != nil {
 		t.Fatalf("init db first start: %v", err)
@@ -90,7 +121,7 @@ func TestControlPlaneRestartPreservesDesiredStateAndHeartbeat(t *testing.T) {
 		http.MethodPost,
 		"/debug/set-desired?nodeID="+nodeID+"&version=3",
 		desiredPayload,
-		nil,
+		authorizedHeaders(nil),
 	)
 	if setDesiredResp.Code != http.StatusOK {
 		t.Fatalf("set desired status = %d, want %d", setDesiredResp.Code, http.StatusOK)
@@ -144,6 +175,7 @@ func TestControlPlaneRestartPreservesDesiredStateAndHeartbeat(t *testing.T) {
 
 func TestDesiredStateRemainsAvailableAcrossDBReopen(t *testing.T) {
 	withTempWorkingDir(t)
+	withControlPlaneBasicAuth(t, testControlPlaneUser, testControlPlanePassword)
 
 	if err := initDB(); err != nil {
 		t.Fatalf("init db first open: %v", err)
@@ -190,6 +222,7 @@ func TestDesiredStateRemainsAvailableAcrossDBReopen(t *testing.T) {
 
 func TestGetDesiredStateAfterRestartReturnsBody(t *testing.T) {
 	withTempWorkingDir(t)
+	withControlPlaneBasicAuth(t, testControlPlaneUser, testControlPlanePassword)
 
 	if err := initDB(); err != nil {
 		t.Fatalf("init db first open: %v", err)
@@ -223,6 +256,7 @@ func TestGetDesiredStateAfterRestartReturnsBody(t *testing.T) {
 
 func TestHeartbeatRejectsMissingNodeToken(t *testing.T) {
 	withTempWorkingDir(t)
+	withControlPlaneBasicAuth(t, testControlPlaneUser, testControlPlanePassword)
 
 	if err := initDB(); err != nil {
 		t.Fatalf("init db: %v", err)
@@ -252,6 +286,7 @@ func TestHeartbeatRejectsMissingNodeToken(t *testing.T) {
 
 func TestDesiredStateAcceptsValidNodeToken(t *testing.T) {
 	withTempWorkingDir(t)
+	withControlPlaneBasicAuth(t, testControlPlaneUser, testControlPlanePassword)
 
 	if err := initDB(); err != nil {
 		t.Fatalf("init db first open: %v", err)
@@ -301,5 +336,55 @@ func TestDesiredStateAcceptsValidNodeToken(t *testing.T) {
 	}
 	if strings.TrimSpace(string(body)) != desiredPayload {
 		t.Fatalf("desired state body = %q, want %q", string(body), desiredPayload)
+	}
+}
+
+func TestSetDesiredStateRejectsMissingBasicAuth(t *testing.T) {
+	withTempWorkingDir(t)
+	withControlPlaneBasicAuth(t, testControlPlaneUser, testControlPlanePassword)
+
+	if err := initDB(); err != nil {
+		t.Fatalf("init db: %v", err)
+	}
+
+	mux := testMux()
+	resp := performRequest(t, mux, http.MethodPost, "/debug/set-desired?nodeID=node-1&version=1", `{"version":1}`, nil)
+	if resp.Code != http.StatusUnauthorized {
+		t.Fatalf("set desired state status = %d, want %d", resp.Code, http.StatusUnauthorized)
+	}
+}
+
+func TestHealthAcceptsValidBasicAuth(t *testing.T) {
+	withTempWorkingDir(t)
+	withControlPlaneBasicAuth(t, testControlPlaneUser, testControlPlanePassword)
+
+	if err := initDB(); err != nil {
+		t.Fatalf("init db: %v", err)
+	}
+
+	mux := testMux()
+	resp := performRequest(t, mux, http.MethodGet, "/health", "", authorizedHeaders(nil))
+	if resp.Code != http.StatusOK {
+		t.Fatalf("health status = %d, want %d", resp.Code, http.StatusOK)
+	}
+}
+
+func TestNodesRejectInvalidBasicAuth(t *testing.T) {
+	withTempWorkingDir(t)
+	withControlPlaneBasicAuth(t, testControlPlaneUser, testControlPlanePassword)
+
+	if err := initDB(); err != nil {
+		t.Fatalf("init db: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.SetBasicAuth("wrong", "creds")
+
+	mux := testMux()
+	resp := performRequest(t, mux, http.MethodGet, "/nodes", "", map[string]string{
+		"Authorization": req.Header.Get("Authorization"),
+	})
+	if resp.Code != http.StatusUnauthorized {
+		t.Fatalf("nodes status = %d, want %d", resp.Code, http.StatusUnauthorized)
 	}
 }

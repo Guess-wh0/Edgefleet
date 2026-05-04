@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/rand"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
@@ -9,6 +10,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"strconv"
 	"time"
 
@@ -18,6 +20,8 @@ import (
 
 // Global DB variable
 var db *sql.DB
+var controlPlaneUser = getenv("CONTROL_PLANE_USER", "admin")
+var controlPlanePassword = getenv("CONTROL_PLANE_PASSWORD", "edgefleet")
 
 // constant to Standardize error messages
 const (
@@ -110,6 +114,33 @@ func authenticateNodeRequest(w http.ResponseWriter, r *http.Request, expectedNod
 	}
 	if storedToken == "" || storedToken != nodeToken {
 		http.Error(w, "invalid node token", http.StatusUnauthorized)
+		return false
+	}
+
+	return true
+}
+
+func getenv(key, def string) string {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	return v
+}
+
+func authenticateUserRequest(w http.ResponseWriter, r *http.Request) bool {
+	username, password, ok := r.BasicAuth()
+	if !ok {
+		w.Header().Set("WWW-Authenticate", `Basic realm="edgefleet-control-plane"`)
+		http.Error(w, "basic auth required", http.StatusUnauthorized)
+		return false
+	}
+
+	userMatch := subtle.ConstantTimeCompare([]byte(username), []byte(controlPlaneUser)) == 1
+	passwordMatch := subtle.ConstantTimeCompare([]byte(password), []byte(controlPlanePassword)) == 1
+	if !userMatch || !passwordMatch {
+		w.Header().Set("WWW-Authenticate", `Basic realm="edgefleet-control-plane"`)
+		http.Error(w, "invalid credentials", http.StatusUnauthorized)
 		return false
 	}
 
@@ -239,6 +270,9 @@ func getDesiredState(w http.ResponseWriter, r *http.Request) {
 
 func getHealthDetail(w http.ResponseWriter, r *http.Request) {
 	if !requireMethod(w, r, http.MethodGet) {
+		return
+	}
+	if !authenticateUserRequest(w, r) {
 		return
 	}
 
@@ -389,6 +423,13 @@ func livenessSweep() {
 }
 
 func listNodes(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodGet) {
+		return
+	}
+	if !authenticateUserRequest(w, r) {
+		return
+	}
+
 	rows, err := db.Query(`
 		SELECT node_id, status, last_heartbeat
 		FROM nodes
@@ -415,6 +456,9 @@ func listNodes(w http.ResponseWriter, r *http.Request) {
 // for development stress testing only
 func setDesiredState(w http.ResponseWriter, r *http.Request) {
 	if !requireMethod(w, r, http.MethodPost) {
+		return
+	}
+	if !authenticateUserRequest(w, r) {
 		return
 	}
 

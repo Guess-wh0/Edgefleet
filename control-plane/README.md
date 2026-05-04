@@ -1,7 +1,7 @@
-# EdgeFleet — Control Plane
+# EdgeFleet - Control Plane
 
 Minimal control plane for EdgeFleet.
-Responsible for **node identity, liveness tracking, and coordination primitives**.
+Responsible for **node identity, liveness tracking, desired-state storage, and security guardrails**.
 
 This is **not** a scheduler.
 This is **not** a leader.
@@ -11,14 +11,16 @@ It exists to tell the truth about nodes.
 
 ---
 
-## Responsibilities (Phase 1–2)
+## Responsibilities
 
 ### What it DOES
-- Accept node registration
-- Persist node identity
+- Accept edge registration
+- Issue `node_id` and `node_secret`
+- Persist node identity and secrets
 - Track heartbeats per node
-- Mark nodes `available` / `unavailable` based on time
-- Serve empty desired state (by design)
+- Mark nodes `active` / `unknown` based on time
+- Serve desired state to authenticated edges
+- Require Basic Auth on user/admin endpoints
 
 ### What it explicitly does NOT do
 - Leader election
@@ -26,6 +28,7 @@ It exists to tell the truth about nodes.
 - Workload orchestration
 - Edge-to-edge communication
 - Retry/backoff intelligence
+- OAuth or JWT flows
 
 Coordination first. Intelligence later.
 
@@ -42,14 +45,12 @@ Coordination first. Intelligence later.
 
 ## Project Structure
 
-```
-
+```text
 control-plane/
-├── main.go
-├── go.mod
-├── edgefleet.db   # created at runtime
-
-````
+|-- main.go
+|-- go.mod
+`-- edgefleet.db   # created at runtime
+```
 
 ---
 
@@ -61,15 +62,16 @@ control-plane/
 - No cloud dependencies
 
 Verify Go:
+
 ```bash
 go version
-````
+```
 
 ---
 
 ## Setup
 
-Clone the repository and move into the control plane directory:
+Move into the control-plane directory:
 
 ```bash
 cd control-plane
@@ -100,7 +102,7 @@ go build -o control-plane
 
 Expected output:
 
-```
+```text
 Control Plane starting on :8080
 ```
 
@@ -108,23 +110,57 @@ SQLite database (`edgefleet.db`) is created automatically on first run.
 
 ---
 
-## API Endpoints (Phase 1–2)
+## Authentication Model
+
+### Edge -> Control
+
+- `POST /register` is open so a new edge can bootstrap identity
+- Control plane responds with:
+  - `node_id`
+  - `node_secret`
+- Edge stores both locally and sends them on every later request:
+  - `X-Node-ID`
+  - `X-Node-Token`
+
+### User -> Control
+
+- User/admin endpoints require HTTP Basic Auth
+- Defaults are:
+  - user: `admin`
+  - password: `edgefleet`
+- Override with environment variables:
+  - `CONTROL_PLANE_USER`
+  - `CONTROL_PLANE_PASSWORD`
+
+Example:
+
+```powershell
+$env:CONTROL_PLANE_USER="admin"
+$env:CONTROL_PLANE_PASSWORD="change-me"
+go run .
+```
+
+---
+
+## API Endpoints
 
 ### Health Check
 
-```
+```text
 GET /health
 ```
+
+Requires Basic Auth.
 
 Example:
 
 ```bash
-curl http://localhost:8080/health
+curl -u admin:edgefleet http://localhost:8080/health
 ```
 
 Response:
 
-```
+```text
 nodes=3
 ```
 
@@ -132,14 +168,14 @@ nodes=3
 
 ### Register Node
 
-```
+```text
 POST /register
 ```
 
 Headers:
 
-* `X-Node-Hostname`
-* `X-Node-Arch`
+- `X-Node-Hostname`
+- `X-Node-Arch`
 
 Example:
 
@@ -151,63 +187,111 @@ curl -X POST http://localhost:8080/register \
 
 Response:
 
-```
-<node-id>
+```json
+{
+  "node_id": "f2d8d2c8-...",
+  "node_secret": "8c9d..."
+}
 ```
 
 ---
 
 ### Heartbeat
 
-```
+```text
 POST /heartbeat
 ```
 
 Headers:
 
-* `X-Node-ID`
+- `X-Node-ID`
+- `X-Node-Token`
 
 Example:
 
 ```bash
 curl -X POST http://localhost:8080/heartbeat \
-  -H "X-Node-ID: <node-id>"
+  -H "X-Node-ID: <node-id>" \
+  -H "X-Node-Token: <node-secret>"
 ```
 
 Response:
 
-```
+```text
 ack
 ```
 
 ---
 
-### Desired State (intentionally empty)
+### Desired State
 
-```
+```text
 GET /desired-state/{nodeID}
 ```
+
+Headers:
+
+- `X-Node-ID`
+- `X-Node-Token`
 
 Example:
 
 ```bash
-curl http://localhost:8080/desired-state/<node-id>
+curl http://localhost:8080/desired-state/<node-id> \
+  -H "X-Node-ID: <node-id>" \
+  -H "X-Node-Token: <node-secret>"
 ```
 
 Response:
 
+```json
+{"version":4,"payload":"handler-check"}
 ```
-(empty)
+
+If no desired state exists yet, the response body is empty.
+
+---
+
+### Set Desired State
+
+```text
+POST /debug/set-desired?nodeID={nodeID}&version={version}
+```
+
+Requires Basic Auth.
+
+Example:
+
+```bash
+curl -X POST "http://localhost:8080/debug/set-desired?nodeID=<node-id>&version=5" \
+  -u admin:edgefleet \
+  -d '{"version":5,"payload":"deploy"}'
+```
+
+---
+
+### List Nodes
+
+```text
+GET /nodes
+```
+
+Requires Basic Auth.
+
+Example:
+
+```bash
+curl -u admin:edgefleet http://localhost:8080/nodes
 ```
 
 ---
 
 ## Liveness Model
 
-* Heartbeats update `last_heartbeat`
-* Periodic sweep runs every few seconds
-* Nodes with stale heartbeats are marked `unavailable`
-* A new heartbeat restores `available`
+- Heartbeats update `last_heartbeat`
+- Periodic sweep runs every few seconds
+- Nodes with stale heartbeats are marked `unknown`
+- A new heartbeat restores `active`
 
 No node is ever deleted.
 
@@ -220,6 +304,7 @@ SQLite table: `nodes`
 ```sql
 nodes (
   node_id TEXT PRIMARY KEY,
+  node_secret TEXT,
   last_heartbeat TIMESTAMP,
   status TEXT,
   hostname TEXT,
@@ -227,25 +312,34 @@ nodes (
 )
 ```
 
+SQLite table: `desired_state`
+
+```sql
+desired_state (
+  node_id TEXT PRIMARY KEY,
+  version INTEGER,
+  payload TEXT
+)
+```
+
 ---
 
 ## Operating Assumptions
 
-* Partial connectivity is normal
-* Nodes may flap independently
-* Control plane must remain calm under chaos
-* Identity is sacred and never auto-regenerated
+- Partial connectivity is normal
+- Nodes may flap independently
+- Control plane must remain calm under chaos
+- Identity is sacred and never auto-regenerated without an explicit re-registration path
 
 ---
 
 ## Phase Status
 
-* Phase 1: ✅ Complete
-* Phase 2 (current):
-
-  * Identity hardening: ✅
-  * Multi-node simulation: ✅
-  * Idempotent registration: ⏳ next
+- Phase 3: complete
+- Phase 4 in progress:
+  - Edge identity and token auth: complete
+  - Basic Auth on admin endpoints: complete
+  - Signed desired state: pending
 
 ---
 
@@ -255,8 +349,8 @@ If the control plane panics, the system is already dead.
 
 This code favors:
 
-* determinism
-* explicit state
-* boring correctness
+- determinism
+- explicit state
+- boring correctness
 
 Everything else comes later.
