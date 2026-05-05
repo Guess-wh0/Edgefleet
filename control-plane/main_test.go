@@ -339,6 +339,100 @@ func TestDesiredStateAcceptsValidNodeToken(t *testing.T) {
 	}
 }
 
+func TestEdgeCannotFetchAnotherNodesDesiredState(t *testing.T) {
+	withTempWorkingDir(t)
+	withControlPlaneBasicAuth(t, testControlPlaneUser, testControlPlanePassword)
+
+	if err := initDB(); err != nil {
+		t.Fatalf("init db: %v", err)
+	}
+
+	mux := testMux()
+
+	firstRegister := performRequest(t, mux, http.MethodPost, "/register", "", map[string]string{
+		"X-Node-Hostname": "node-a",
+		"X-Node-Arch":     "amd64",
+	})
+	if firstRegister.Code != http.StatusOK {
+		t.Fatalf("first register status = %d, want %d", firstRegister.Code, http.StatusOK)
+	}
+
+	secondRegister := performRequest(t, mux, http.MethodPost, "/register", "", map[string]string{
+		"X-Node-Hostname": "node-b",
+		"X-Node-Arch":     "amd64",
+	})
+	if secondRegister.Code != http.StatusOK {
+		t.Fatalf("second register status = %d, want %d", secondRegister.Code, http.StatusOK)
+	}
+
+	var firstNode RegistrationResponse
+	if err := json.Unmarshal(firstRegister.Body.Bytes(), &firstNode); err != nil {
+		t.Fatalf("decode first register response: %v", err)
+	}
+	var secondNode RegistrationResponse
+	if err := json.Unmarshal(secondRegister.Body.Bytes(), &secondNode); err != nil {
+		t.Fatalf("decode second register response: %v", err)
+	}
+
+	const desiredPayload = `{"version":8,"payload":"node-b-only"}`
+	setDesiredResp := performRequest(
+		t,
+		mux,
+		http.MethodPost,
+		"/debug/set-desired?nodeID="+secondNode.NodeID+"&version=8",
+		desiredPayload,
+		authorizedHeaders(nil),
+	)
+	if setDesiredResp.Code != http.StatusOK {
+		t.Fatalf("set desired status = %d, want %d", setDesiredResp.Code, http.StatusOK)
+	}
+
+	resp := performRequest(t, mux, http.MethodGet, "/desired-state/"+secondNode.NodeID, "", map[string]string{
+		"X-Node-ID":    firstNode.NodeID,
+		"X-Node-Token": firstNode.NodeSecret,
+	})
+	if resp.Code != http.StatusUnauthorized {
+		t.Fatalf("cross-node desired state status = %d, want %d", resp.Code, http.StatusUnauthorized)
+	}
+}
+
+func TestEdgeCannotHeartbeatAsAnotherNode(t *testing.T) {
+	withTempWorkingDir(t)
+	withControlPlaneBasicAuth(t, testControlPlaneUser, testControlPlanePassword)
+
+	if err := initDB(); err != nil {
+		t.Fatalf("init db: %v", err)
+	}
+
+	mux := testMux()
+
+	firstRegister := performRequest(t, mux, http.MethodPost, "/register", "", map[string]string{
+		"X-Node-Hostname": "node-a",
+		"X-Node-Arch":     "amd64",
+	})
+	secondRegister := performRequest(t, mux, http.MethodPost, "/register", "", map[string]string{
+		"X-Node-Hostname": "node-b",
+		"X-Node-Arch":     "amd64",
+	})
+
+	var firstNode RegistrationResponse
+	if err := json.Unmarshal(firstRegister.Body.Bytes(), &firstNode); err != nil {
+		t.Fatalf("decode first register response: %v", err)
+	}
+	var secondNode RegistrationResponse
+	if err := json.Unmarshal(secondRegister.Body.Bytes(), &secondNode); err != nil {
+		t.Fatalf("decode second register response: %v", err)
+	}
+
+	resp := performRequest(t, mux, http.MethodPost, "/heartbeat", "", map[string]string{
+		"X-Node-ID":    secondNode.NodeID,
+		"X-Node-Token": firstNode.NodeSecret,
+	})
+	if resp.Code != http.StatusUnauthorized {
+		t.Fatalf("cross-node heartbeat status = %d, want %d", resp.Code, http.StatusUnauthorized)
+	}
+}
+
 func TestSetDesiredStateRejectsMissingBasicAuth(t *testing.T) {
 	withTempWorkingDir(t)
 	withControlPlaneBasicAuth(t, testControlPlaneUser, testControlPlanePassword)
@@ -351,6 +445,41 @@ func TestSetDesiredStateRejectsMissingBasicAuth(t *testing.T) {
 	resp := performRequest(t, mux, http.MethodPost, "/debug/set-desired?nodeID=node-1&version=1", `{"version":1}`, nil)
 	if resp.Code != http.StatusUnauthorized {
 		t.Fatalf("set desired state status = %d, want %d", resp.Code, http.StatusUnauthorized)
+	}
+}
+
+func TestSetDesiredStateAcceptsValidBasicAuth(t *testing.T) {
+	withTempWorkingDir(t)
+	withControlPlaneBasicAuth(t, testControlPlaneUser, testControlPlanePassword)
+
+	if err := initDB(); err != nil {
+		t.Fatalf("init db: %v", err)
+	}
+
+	mux := testMux()
+	resp := performRequest(
+		t,
+		mux,
+		http.MethodPost,
+		"/debug/set-desired?nodeID=node-admin&version=6",
+		`{"version":6,"payload":"admin-control"}`,
+		authorizedHeaders(nil),
+	)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("set desired state status = %d, want %d", resp.Code, http.StatusOK)
+	}
+
+	var version int
+	var payload string
+	err := db.QueryRow(`SELECT version, payload FROM desired_state WHERE node_id = ?`, "node-admin").Scan(&version, &payload)
+	if err != nil {
+		t.Fatalf("query desired state after admin update: %v", err)
+	}
+	if version != 6 {
+		t.Fatalf("desired state version = %d, want %d", version, 6)
+	}
+	if payload != `{"version":6,"payload":"admin-control"}` {
+		t.Fatalf("desired state payload = %q", payload)
 	}
 }
 
@@ -386,5 +515,32 @@ func TestNodesRejectInvalidBasicAuth(t *testing.T) {
 	})
 	if resp.Code != http.StatusUnauthorized {
 		t.Fatalf("nodes status = %d, want %d", resp.Code, http.StatusUnauthorized)
+	}
+}
+
+func TestNodesAcceptValidBasicAuth(t *testing.T) {
+	withTempWorkingDir(t)
+	withControlPlaneBasicAuth(t, testControlPlaneUser, testControlPlanePassword)
+
+	if err := initDB(); err != nil {
+		t.Fatalf("init db: %v", err)
+	}
+
+	if _, err := db.Exec(
+		`INSERT INTO nodes (node_id, node_secret, last_heartbeat, status, hostname, arch)
+		VALUES (?, ?, CURRENT_TIMESTAMP, 'active', 'node-visible', 'amd64')`,
+		"node-visible",
+		"secret-visible",
+	); err != nil {
+		t.Fatalf("insert node: %v", err)
+	}
+
+	mux := testMux()
+	resp := performRequest(t, mux, http.MethodGet, "/nodes", "", authorizedHeaders(nil))
+	if resp.Code != http.StatusOK {
+		t.Fatalf("nodes status = %d, want %d", resp.Code, http.StatusOK)
+	}
+	if !strings.Contains(resp.Body.String(), "node-visible | active |") {
+		t.Fatalf("nodes body = %q, want node listing", resp.Body.String())
 	}
 }
