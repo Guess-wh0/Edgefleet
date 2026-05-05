@@ -8,3 +8,4 @@ edge-agent/*/applied_version.txt
 *.exe
 *.db-shm
 *db-wal
+*/.gocache/*

@@ -1,6 +1,9 @@
 package main
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,8 +24,9 @@ const stateFileName = "state.json"
 var stateFile = ""
 
 type DesiredState struct {
-	Version int    `json:"version"`
-	Payload string `json:"payload"`
+	Version   int    `json:"version"`
+	Payload   string `json:"payload"`
+	Signature string `json:"signature"`
 }
 
 type RegistrationResponse struct {
@@ -34,6 +38,17 @@ type PersistentState struct {
 	NodeID             string `json:"node_id"`
 	NodeSecret         string `json:"node_secret"`
 	LastAppliedVersion int    `json:"last_applied_desired_state_version"`
+}
+
+func signDesiredState(nodeID string, version int, payload, nodeSecret string) string {
+	mac := hmac.New(sha256.New, []byte(nodeSecret))
+	_, _ = mac.Write([]byte(fmt.Sprintf("%s\n%d\n%s", nodeID, version, payload)))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func verifyDesiredStateSignature(state PersistentState, ds DesiredState) bool {
+	expected := signDesiredState(state.NodeID, ds.Version, ds.Payload, state.NodeSecret)
+	return hmac.Equal([]byte(expected), []byte(ds.Signature))
 }
 
 func loadPersistentState() PersistentState {
@@ -243,6 +258,10 @@ func reconcile(state *PersistentState) {
 	}
 
 	if ds == nil {
+		return
+	}
+	if !verifyDesiredStateSignature(*state, *ds) {
+		log.Printf("[RECONCILE] invalid signature version=%d", ds.Version)
 		return
 	}
 

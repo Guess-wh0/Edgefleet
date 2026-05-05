@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"log"
 	"net/http"
 	"net/http/httptest"
@@ -16,18 +17,22 @@ type fakeControlPlane struct {
 	mu             sync.Mutex
 	nodeID         string
 	nodeSecret     string
+	signingSecret  string
 	registerCount  int
 	heartbeatNodes []string
-	desiredBody    string
+	desiredVersion int
+	desiredPayload string
 }
 
-func newFakeControlPlane(t *testing.T, desiredBody string) (*fakeControlPlane, *httptest.Server) {
+func newFakeControlPlane(t *testing.T, desiredVersion int, desiredPayload string) (*fakeControlPlane, *httptest.Server) {
 	t.Helper()
 
 	cp := &fakeControlPlane{
-		nodeID:      "node-1",
-		nodeSecret:  "secret-1",
-		desiredBody: desiredBody,
+		nodeID:         "node-1",
+		nodeSecret:     "secret-1",
+		signingSecret:  "secret-1",
+		desiredVersion: desiredVersion,
+		desiredPayload: desiredPayload,
 	}
 
 	mux := http.NewServeMux()
@@ -69,8 +74,15 @@ func newFakeControlPlane(t *testing.T, desiredBody string) (*fakeControlPlane, *
 			return
 		}
 
+		envelope := DesiredState{
+			Version:   cp.desiredVersion,
+			Payload:   cp.desiredPayload,
+			Signature: signDesiredState(cp.nodeID, cp.desiredVersion, cp.desiredPayload, cp.signingSecret),
+		}
+
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(cp.desiredBody))
+		_ = json.NewEncoder(w).Encode(envelope)
 	})
 
 	server := httptest.NewServer(mux)
@@ -192,7 +204,7 @@ func TestInitializeLocalStateReregistersWhenSecretMissing(t *testing.T) {
 	tempDir := t.TempDir()
 	logBuffer := withLogBuffer(t)
 
-	cp, server := newFakeControlPlane(t, `{"version":1,"payload":"secure-bootstrap"}`)
+	cp, server := newFakeControlPlane(t, 1, "secure-bootstrap")
 	withControlPlaneBase(t, server.URL)
 
 	withStateFile(t, filepath.Join(tempDir, stateFileName))
@@ -225,7 +237,7 @@ func TestEdgeRestartReusesNodeIDAndReconcilesIdempotently(t *testing.T) {
 	tempDir := t.TempDir()
 	logBuffer := withLogBuffer(t)
 
-	cp, server := newFakeControlPlane(t, `{"version":4,"payload":"restart-drill"}`)
+	cp, server := newFakeControlPlane(t, 4, "restart-drill")
 	withControlPlaneBase(t, server.URL)
 
 	firstStart := initializeLocalState(tempDir)
@@ -316,7 +328,7 @@ func TestEdgeRestartDetectsDriftAndAppliesUpdatedDesiredStateOnce(t *testing.T) 
 	tempDir := t.TempDir()
 	logBuffer := withLogBuffer(t)
 
-	cp, server := newFakeControlPlane(t, `{"version":4,"payload":"before-offline"}`)
+	cp, server := newFakeControlPlane(t, 4, "before-offline")
 	withControlPlaneBase(t, server.URL)
 
 	firstStart := initializeLocalState(tempDir)
@@ -331,7 +343,8 @@ func TestEdgeRestartDetectsDriftAndAppliesUpdatedDesiredStateOnce(t *testing.T) 
 	}
 
 	cp.mu.Lock()
-	cp.desiredBody = `{"version":5,"payload":"after-offline"}`
+	cp.desiredVersion = 5
+	cp.desiredPayload = "after-offline"
 	cp.mu.Unlock()
 
 	logBuffer.Reset()
@@ -387,5 +400,39 @@ func TestEdgeRestartDetectsDriftAndAppliesUpdatedDesiredStateOnce(t *testing.T) 
 	}
 	if strings.Contains(secondLogs, "[REGISTER]") {
 		t.Fatalf("restart logs should not register again, got %q", secondLogs)
+	}
+}
+
+func TestEdgeRejectsInvalidDesiredStateSignature(t *testing.T) {
+	tempDir := t.TempDir()
+	logBuffer := withLogBuffer(t)
+
+	cp, server := newFakeControlPlane(t, 7, "tampered")
+	withControlPlaneBase(t, server.URL)
+
+	cp.mu.Lock()
+	cp.signingSecret = "control-plane-secret"
+	cp.mu.Unlock()
+
+	state := PersistentState{
+		NodeID:     "node-1",
+		NodeSecret: "secret-1",
+	}
+	withStateFile(t, filepath.Join(tempDir, stateFileName))
+	savePersistentState(state)
+
+	runOnce(&state)
+
+	persisted := loadPersistentState()
+	if persisted.LastAppliedVersion != 0 {
+		t.Fatalf("persisted version after invalid signature = %d, want %d", persisted.LastAppliedVersion, 0)
+	}
+
+	logs := logBuffer.String()
+	if !strings.Contains(logs, "[RECONCILE] invalid signature version=7") {
+		t.Fatalf("expected invalid signature log, got %q", logs)
+	}
+	if strings.Contains(logs, "[RECONCILE] applying") {
+		t.Fatalf("should not apply tampered desired state, got %q", logs)
 	}
 }

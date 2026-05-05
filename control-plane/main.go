@@ -1,7 +1,9 @@
 package main
 
 import (
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"database/sql"
 	"encoding/hex"
@@ -46,6 +48,12 @@ type Node struct {
 type RegistrationResponse struct {
 	NodeID     string `json:"node_id"`
 	NodeSecret string `json:"node_secret"`
+}
+
+type DesiredStateEnvelope struct {
+	Version   int    `json:"version"`
+	Payload   string `json:"payload"`
+	Signature string `json:"signature"`
 }
 
 // Helper method to validate request method
@@ -118,6 +126,12 @@ func authenticateNodeRequest(w http.ResponseWriter, r *http.Request, expectedNod
 	}
 
 	return true
+}
+
+func signDesiredState(nodeID string, version int, payload, nodeSecret string) string {
+	mac := hmac.New(sha256.New, []byte(nodeSecret))
+	_, _ = mac.Write([]byte(fmt.Sprintf("%s\n%d\n%s", nodeID, version, payload)))
+	return hex.EncodeToString(mac.Sum(nil))
 }
 
 func getenv(key, def string) string {
@@ -240,12 +254,14 @@ func getDesiredState(w http.ResponseWriter, r *http.Request) {
 
 	var version int
 	var payload string
+	var nodeSecret string
 
 	err := db.QueryRow(`
-		SELECT version, payload
-		FROM desired_state
-		WHERE node_id = ?
-	`, nodeID).Scan(&version, &payload)
+		SELECT d.version, d.payload, n.node_secret
+		FROM desired_state d
+		JOIN nodes n ON n.node_id = d.node_id
+		WHERE d.node_id = ?
+	`, nodeID).Scan(&version, &payload, &nodeSecret)
 
 	if err == sql.ErrNoRows {
 		w.WriteHeader(http.StatusOK)
@@ -264,8 +280,15 @@ func getDesiredState(w http.ResponseWriter, r *http.Request) {
 		time.Now().Format(time.RFC3339),
 	)
 
+	envelope := DesiredStateEnvelope{
+		Version:   version,
+		Payload:   payload,
+		Signature: signDesiredState(nodeID, version, payload, nodeSecret),
+	}
+
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(payload))
+	_ = json.NewEncoder(w).Encode(envelope)
 }
 
 func getHealthDetail(w http.ResponseWriter, r *http.Request) {

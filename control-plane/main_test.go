@@ -155,8 +155,18 @@ func TestControlPlaneRestartPreservesDesiredStateAndHeartbeat(t *testing.T) {
 	if desiredResp.Code != http.StatusOK {
 		t.Fatalf("desired state fetch status = %d, want %d", desiredResp.Code, http.StatusOK)
 	}
-	if strings.TrimSpace(desiredResp.Body.String()) != desiredPayload {
-		t.Fatalf("desired state after restart = %q, want %q", desiredResp.Body.String(), desiredPayload)
+	var desiredEnvelope DesiredStateEnvelope
+	if err := json.Unmarshal(desiredResp.Body.Bytes(), &desiredEnvelope); err != nil {
+		t.Fatalf("decode desired state after restart: %v", err)
+	}
+	if desiredEnvelope.Payload != desiredPayload {
+		t.Fatalf("desired state payload after restart = %q, want %q", desiredEnvelope.Payload, desiredPayload)
+	}
+	if desiredEnvelope.Version != 3 {
+		t.Fatalf("desired state version after restart = %d, want %d", desiredEnvelope.Version, 3)
+	}
+	if desiredEnvelope.Signature != signDesiredState(nodeID, 3, desiredPayload, registration.NodeSecret) {
+		t.Fatalf("desired state signature after restart did not match expected value")
 	}
 
 	var status string
@@ -334,8 +344,68 @@ func TestDesiredStateAcceptsValidNodeToken(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read handler body: %v", err)
 	}
-	if strings.TrimSpace(string(body)) != desiredPayload {
-		t.Fatalf("desired state body = %q, want %q", string(body), desiredPayload)
+	var envelope DesiredStateEnvelope
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		t.Fatalf("decode desired state body: %v", err)
+	}
+	if envelope.Payload != desiredPayload {
+		t.Fatalf("desired state payload = %q, want %q", envelope.Payload, desiredPayload)
+	}
+	if envelope.Version != 4 {
+		t.Fatalf("desired state version = %d, want %d", envelope.Version, 4)
+	}
+	if envelope.Signature != signDesiredState(registration.NodeID, 4, desiredPayload, registration.NodeSecret) {
+		t.Fatalf("desired state signature did not match expected value")
+	}
+}
+
+func TestDesiredStateResponseIsSigned(t *testing.T) {
+	withTempWorkingDir(t)
+	withControlPlaneBasicAuth(t, testControlPlaneUser, testControlPlanePassword)
+
+	if err := initDB(); err != nil {
+		t.Fatalf("init db: %v", err)
+	}
+
+	mux := testMux()
+	registerResp := performRequest(t, mux, http.MethodPost, "/register", "", map[string]string{
+		"X-Node-Hostname": "signed-node",
+		"X-Node-Arch":     "amd64",
+	})
+	if registerResp.Code != http.StatusOK {
+		t.Fatalf("register status = %d, want %d", registerResp.Code, http.StatusOK)
+	}
+
+	var registration RegistrationResponse
+	if err := json.Unmarshal(registerResp.Body.Bytes(), &registration); err != nil {
+		t.Fatalf("decode register response: %v", err)
+	}
+
+	const desiredPayload = "signed-payload"
+	if err := upsertDesiredState(registration.NodeID, 12, desiredPayload); err != nil {
+		t.Fatalf("upsert desired state: %v", err)
+	}
+
+	resp := performRequest(t, mux, http.MethodGet, "/desired-state/"+registration.NodeID, "", map[string]string{
+		"X-Node-ID":    registration.NodeID,
+		"X-Node-Token": registration.NodeSecret,
+	})
+	if resp.Code != http.StatusOK {
+		t.Fatalf("desired state status = %d, want %d", resp.Code, http.StatusOK)
+	}
+
+	var envelope DesiredStateEnvelope
+	if err := json.Unmarshal(resp.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("decode desired state response: %v", err)
+	}
+	if envelope.Version != 12 {
+		t.Fatalf("desired state version = %d, want %d", envelope.Version, 12)
+	}
+	if envelope.Payload != desiredPayload {
+		t.Fatalf("desired state payload = %q, want %q", envelope.Payload, desiredPayload)
+	}
+	if envelope.Signature != signDesiredState(registration.NodeID, 12, desiredPayload, registration.NodeSecret) {
+		t.Fatalf("desired state signature did not match expected value")
 	}
 }
 
