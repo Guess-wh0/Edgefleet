@@ -40,6 +40,10 @@ type PersistentState struct {
 	LastAppliedVersion int    `json:"last_applied_desired_state_version"`
 }
 
+func isSecurityFailureStatus(statusCode int) bool {
+	return statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden
+}
+
 func signDesiredState(nodeID string, version int, payload, nodeSecret string) string {
 	mac := hmac.New(sha256.New, []byte(nodeSecret))
 	_, _ = mac.Write([]byte(fmt.Sprintf("%s\n%d\n%s", nodeID, version, payload)))
@@ -191,6 +195,10 @@ func sendHeartbeat(state PersistentState) {
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
+		if isSecurityFailureStatus(resp.StatusCode) {
+			log.Printf("[SECURITY][REJECT] heartbeat status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(body)))
+			return
+		}
 		log.Printf("heartbeat rejected: status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(body)))
 		return
 	}
@@ -232,6 +240,9 @@ func fetchDesiredState(state PersistentState) (*DesiredState, error) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
+		if isSecurityFailureStatus(resp.StatusCode) {
+			return nil, fmt.Errorf("security rejection fetching desired state: status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(body)))
+		}
 		return nil, fmt.Errorf("desired state fetch failed: status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 
@@ -261,6 +272,7 @@ func reconcile(state *PersistentState) {
 		return
 	}
 	if !verifyDesiredStateSignature(*state, *ds) {
+		log.Printf("[SECURITY][REJECT] desired-state invalid signature version=%d", ds.Version)
 		log.Printf("[RECONCILE] invalid signature version=%d", ds.Version)
 		return
 	}

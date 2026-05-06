@@ -471,3 +471,75 @@ func TestEdgeRejectsStaleDesiredStateReplay(t *testing.T) {
 		t.Fatalf("should not apply stale desired state, got %q", logs)
 	}
 }
+
+func TestEdgeInvalidSignatureDoesNotBreakLaterValidReconcile(t *testing.T) {
+	tempDir := t.TempDir()
+	logBuffer := withLogBuffer(t)
+
+	cp, server := newFakeControlPlane(t, 7, "tampered-first")
+	withControlPlaneBase(t, server.URL)
+
+	cp.mu.Lock()
+	cp.signingSecret = "wrong-secret"
+	cp.mu.Unlock()
+
+	state := PersistentState{
+		NodeID:     "node-1",
+		NodeSecret: "secret-1",
+	}
+	withStateFile(t, filepath.Join(tempDir, stateFileName))
+	savePersistentState(state)
+
+	runOnce(&state)
+
+	if state.LastAppliedVersion != 0 {
+		t.Fatalf("version after invalid signature = %d, want %d", state.LastAppliedVersion, 0)
+	}
+
+	firstLogs := logBuffer.String()
+	if !strings.Contains(firstLogs, "[SECURITY][REJECT] desired-state invalid signature version=7") {
+		t.Fatalf("expected security reject log, got %q", firstLogs)
+	}
+	if strings.Contains(firstLogs, "[RECONCILE] success version=7") {
+		t.Fatalf("should not report success for invalid signature, got %q", firstLogs)
+	}
+
+	cp.mu.Lock()
+	cp.signingSecret = cp.nodeSecret
+	cp.desiredVersion = 8
+	cp.desiredPayload = "trusted-now"
+	registerCount := cp.registerCount
+	cp.mu.Unlock()
+
+	if registerCount != 0 {
+		t.Fatalf("unexpected register count before recovery = %d, want %d", registerCount, 0)
+	}
+
+	logBuffer.Reset()
+	runOnce(&state)
+
+	if state.LastAppliedVersion != 8 {
+		t.Fatalf("version after recovery reconcile = %d, want %d", state.LastAppliedVersion, 8)
+	}
+
+	persisted := loadPersistentState()
+	if persisted.LastAppliedVersion != 8 {
+		t.Fatalf("persisted version after recovery reconcile = %d, want %d", persisted.LastAppliedVersion, 8)
+	}
+
+	cp.mu.Lock()
+	heartbeatCount := len(cp.heartbeatNodes)
+	cp.mu.Unlock()
+
+	if heartbeatCount != 2 {
+		t.Fatalf("heartbeat count across reject and recovery = %d, want %d", heartbeatCount, 2)
+	}
+
+	secondLogs := logBuffer.String()
+	if !strings.Contains(secondLogs, "[RECONCILE] compare remote=8 local=0 result=drift") {
+		t.Fatalf("expected drift log on recovery, got %q", secondLogs)
+	}
+	if !strings.Contains(secondLogs, "[RECONCILE] success version=8") {
+		t.Fatalf("expected successful reconcile after recovery, got %q", secondLogs)
+	}
+}

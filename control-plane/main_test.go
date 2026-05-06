@@ -531,6 +531,71 @@ func TestEdgeCannotHeartbeatAsAnotherNode(t *testing.T) {
 	}
 }
 
+func TestDesiredStateRejectDoesNotBreakLaterValidFetch(t *testing.T) {
+	withTempWorkingDir(t)
+	withControlPlaneBasicAuth(t, testControlPlaneUser, testControlPlanePassword)
+	logBuffer := withLogBuffer(t)
+
+	if err := initDB(); err != nil {
+		t.Fatalf("init db: %v", err)
+	}
+
+	mux := testMux()
+
+	firstRegister := performRequest(t, mux, http.MethodPost, "/register", "", map[string]string{
+		"X-Node-Hostname": "node-a",
+		"X-Node-Arch":     "amd64",
+	})
+	secondRegister := performRequest(t, mux, http.MethodPost, "/register", "", map[string]string{
+		"X-Node-Hostname": "node-b",
+		"X-Node-Arch":     "amd64",
+	})
+
+	var firstNode RegistrationResponse
+	if err := json.Unmarshal(firstRegister.Body.Bytes(), &firstNode); err != nil {
+		t.Fatalf("decode first register response: %v", err)
+	}
+	var secondNode RegistrationResponse
+	if err := json.Unmarshal(secondRegister.Body.Bytes(), &secondNode); err != nil {
+		t.Fatalf("decode second register response: %v", err)
+	}
+
+	const desiredPayload = `{"version":10,"payload":"still-works"}`
+	if err := upsertDesiredState(secondNode.NodeID, 10, desiredPayload); err != nil {
+		t.Fatalf("upsert desired state: %v", err)
+	}
+
+	rejectResp := performRequest(t, mux, http.MethodGet, "/desired-state/"+secondNode.NodeID, "", map[string]string{
+		"X-Node-ID":    firstNode.NodeID,
+		"X-Node-Token": firstNode.NodeSecret,
+	})
+	if rejectResp.Code != http.StatusUnauthorized {
+		t.Fatalf("reject status = %d, want %d", rejectResp.Code, http.StatusUnauthorized)
+	}
+
+	validResp := performRequest(t, mux, http.MethodGet, "/desired-state/"+secondNode.NodeID, "", map[string]string{
+		"X-Node-ID":    secondNode.NodeID,
+		"X-Node-Token": secondNode.NodeSecret,
+	})
+	if validResp.Code != http.StatusOK {
+		t.Fatalf("valid fetch status after reject = %d, want %d", validResp.Code, http.StatusOK)
+	}
+
+	var envelope DesiredStateEnvelope
+	if err := json.Unmarshal(validResp.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("decode valid desired state response: %v", err)
+	}
+	if envelope.Version != 10 {
+		t.Fatalf("valid fetch version after reject = %d, want %d", envelope.Version, 10)
+	}
+	if envelope.Payload != desiredPayload {
+		t.Fatalf("valid fetch payload after reject = %q, want %q", envelope.Payload, desiredPayload)
+	}
+	if !strings.Contains(logBuffer.String(), "[AUTH][REJECT] path=/desired-state/"+secondNode.NodeID+" reason=node-id-mismatch presented_node="+firstNode.NodeID+" expected_node="+secondNode.NodeID) {
+		t.Fatalf("expected reject log before valid fetch, got %q", logBuffer.String())
+	}
+}
+
 func TestSetDesiredStateRejectsMissingBasicAuth(t *testing.T) {
 	withTempWorkingDir(t)
 	withControlPlaneBasicAuth(t, testControlPlaneUser, testControlPlanePassword)
