@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -87,6 +89,24 @@ func authorizedHeaders(headers map[string]string) map[string]string {
 	req.SetBasicAuth(testControlPlaneUser, testControlPlanePassword)
 	headers["Authorization"] = req.Header.Get("Authorization")
 	return headers
+}
+
+func withLogBuffer(t *testing.T) *bytes.Buffer {
+	t.Helper()
+
+	var buffer bytes.Buffer
+	previousWriter := log.Writer()
+	previousFlags := log.Flags()
+
+	log.SetOutput(&buffer)
+	log.SetFlags(0)
+
+	t.Cleanup(func() {
+		log.SetOutput(previousWriter)
+		log.SetFlags(previousFlags)
+	})
+
+	return &buffer
 }
 
 func TestControlPlaneRestartPreservesDesiredStateAndHeartbeat(t *testing.T) {
@@ -412,6 +432,7 @@ func TestDesiredStateResponseIsSigned(t *testing.T) {
 func TestEdgeCannotFetchAnotherNodesDesiredState(t *testing.T) {
 	withTempWorkingDir(t)
 	withControlPlaneBasicAuth(t, testControlPlaneUser, testControlPlanePassword)
+	logBuffer := withLogBuffer(t)
 
 	if err := initDB(); err != nil {
 		t.Fatalf("init db: %v", err)
@@ -464,11 +485,15 @@ func TestEdgeCannotFetchAnotherNodesDesiredState(t *testing.T) {
 	if resp.Code != http.StatusUnauthorized {
 		t.Fatalf("cross-node desired state status = %d, want %d", resp.Code, http.StatusUnauthorized)
 	}
+	if !strings.Contains(logBuffer.String(), "[AUTH][REJECT] path=/desired-state/"+secondNode.NodeID+" reason=node-id-mismatch presented_node="+firstNode.NodeID+" expected_node="+secondNode.NodeID) {
+		t.Fatalf("expected ownership mismatch log, got %q", logBuffer.String())
+	}
 }
 
 func TestEdgeCannotHeartbeatAsAnotherNode(t *testing.T) {
 	withTempWorkingDir(t)
 	withControlPlaneBasicAuth(t, testControlPlaneUser, testControlPlanePassword)
+	logBuffer := withLogBuffer(t)
 
 	if err := initDB(); err != nil {
 		t.Fatalf("init db: %v", err)
@@ -500,6 +525,9 @@ func TestEdgeCannotHeartbeatAsAnotherNode(t *testing.T) {
 	})
 	if resp.Code != http.StatusUnauthorized {
 		t.Fatalf("cross-node heartbeat status = %d, want %d", resp.Code, http.StatusUnauthorized)
+	}
+	if !strings.Contains(logBuffer.String(), "[AUTH][REJECT] path=/heartbeat reason=invalid-node-token presented_node="+secondNode.NodeID+" expected_node="+secondNode.NodeID) {
+		t.Fatalf("expected token mismatch log, got %q", logBuffer.String())
 	}
 }
 

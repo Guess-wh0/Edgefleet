@@ -9,4 +9,6 @@ edge-agent/*/applied_version.txt
 *.db-shm
 *db-wal
 */.gocache/*
-coverage*
+coverage
+coverage.html
+*.coverprofile

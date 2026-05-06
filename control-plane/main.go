@@ -87,6 +87,20 @@ func nodeTokenMissing(w http.ResponseWriter, nodeToken string) bool {
 	return false
 }
 
+func logNodeAuthReject(r *http.Request, reason, presentedNodeID, expectedNodeID string) {
+	log.Printf(
+		"[AUTH][REJECT] path=%s reason=%s presented_node=%s expected_node=%s",
+		r.URL.Path,
+		reason,
+		presentedNodeID,
+		expectedNodeID,
+	)
+}
+
+func logUserAuthReject(r *http.Request, reason string) {
+	log.Printf("[USER_AUTH][REJECT] path=%s reason=%s", r.URL.Path, reason)
+}
+
 func generateNodeSecret() (string, error) {
 	buf := make([]byte, 32)
 	if _, err := rand.Read(buf); err != nil {
@@ -98,29 +112,35 @@ func generateNodeSecret() (string, error) {
 func authenticateNodeRequest(w http.ResponseWriter, r *http.Request, expectedNodeID string) bool {
 	nodeID := r.Header.Get("X-Node-ID")
 	if nodeIdMissing(w, nodeID) {
+		logNodeAuthReject(r, "missing-node-id", nodeID, expectedNodeID)
 		return false
 	}
 	if expectedNodeID != "" && nodeID != expectedNodeID {
+		logNodeAuthReject(r, "node-id-mismatch", nodeID, expectedNodeID)
 		http.Error(w, "node id mismatch", http.StatusUnauthorized)
 		return false
 	}
 
 	nodeToken := r.Header.Get("X-Node-Token")
 	if nodeTokenMissing(w, nodeToken) {
+		logNodeAuthReject(r, "missing-node-token", nodeID, expectedNodeID)
 		return false
 	}
 
 	var storedToken string
 	err := db.QueryRow(`SELECT node_secret FROM nodes WHERE node_id = ?`, nodeID).Scan(&storedToken)
 	if err == sql.ErrNoRows {
+		logNodeAuthReject(r, "unknown-node", nodeID, expectedNodeID)
 		http.Error(w, "unknown node", http.StatusUnauthorized)
 		return false
 	}
 	if err != nil {
+		log.Printf("[AUTH][ERROR] path=%s node=%s err=%v", r.URL.Path, nodeID, err)
 		http.Error(w, "db error", http.StatusInternalServerError)
 		return false
 	}
-	if storedToken == "" || storedToken != nodeToken {
+	if storedToken == "" || subtle.ConstantTimeCompare([]byte(storedToken), []byte(nodeToken)) != 1 {
+		logNodeAuthReject(r, "invalid-node-token", nodeID, expectedNodeID)
 		http.Error(w, "invalid node token", http.StatusUnauthorized)
 		return false
 	}
@@ -145,6 +165,7 @@ func getenv(key, def string) string {
 func authenticateUserRequest(w http.ResponseWriter, r *http.Request) bool {
 	username, password, ok := r.BasicAuth()
 	if !ok {
+		logUserAuthReject(r, "missing-basic-auth")
 		w.Header().Set("WWW-Authenticate", `Basic realm="edgefleet-control-plane"`)
 		http.Error(w, "basic auth required", http.StatusUnauthorized)
 		return false
@@ -153,6 +174,7 @@ func authenticateUserRequest(w http.ResponseWriter, r *http.Request) bool {
 	userMatch := subtle.ConstantTimeCompare([]byte(username), []byte(controlPlaneUser)) == 1
 	passwordMatch := subtle.ConstantTimeCompare([]byte(password), []byte(controlPlanePassword)) == 1
 	if !userMatch || !passwordMatch {
+		logUserAuthReject(r, "invalid-basic-auth")
 		w.Header().Set("WWW-Authenticate", `Basic realm="edgefleet-control-plane"`)
 		http.Error(w, "invalid credentials", http.StatusUnauthorized)
 		return false
