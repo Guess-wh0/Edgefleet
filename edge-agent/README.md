@@ -20,6 +20,7 @@ Specifically, it:
 - Continues operating even when the control plane is unavailable
 - Maintains local runtime state in `state.json`
 - Stores its assigned `node_id` and `node_secret` locally
+- Verifies signed desired state before applying it
 - Enforces local safety constraints (CPU, memory, basic sanity checks)
 - Initiates all communication with the control plane (pull-based)
 
@@ -93,6 +94,21 @@ It degrades gracefully.
 This file is a boundary.
 Crossing it is a bug.
 
+
+---
+
+## Run Tests
+
+From `edge-agent/`:
+
+```powershell
+go test ./...
+go test ./... -coverprofile=coverage
+go tool cover -func=coverage
+go tool cover -html=coverage -o coverage.html
+```
+
+Open `coverage.html` in a browser to inspect detailed coverage.
 
 ---
 

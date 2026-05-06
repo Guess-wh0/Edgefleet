@@ -81,12 +81,37 @@ Current state:
 - Replay-safe reconciliation
 - Edge identity with `node_id` and `node_secret`
 - Token-authenticated edge requests
+- Signed desired state delivered with HMAC
+- Edge verifies signatures before applying
 - Basic Auth on control-plane user/admin endpoints
 
-Next work in this phase will introduce:
-- Signed desired state
-- Stronger trust-boundary checks
-- Rejection of tampered control inputs
+Security test coverage is documented in `TESTING.md`.
+
+---
+
+## Running Tests
+
+Run the module tests from each Go module directory:
+
+```powershell
+cd control-plane
+go test ./...
+```
+
+```powershell
+cd edge-agent
+go test ./...
+```
+
+Generate a coverage profile inside either module:
+
+```powershell
+go test ./... -coverprofile=coverage
+go tool cover -func=coverage
+go tool cover -html=coverage -o coverage.html
+```
+
+Open `coverage.html` in a browser to inspect line-by-line coverage.
 
 ---
 
@@ -96,6 +121,7 @@ Next work in this phase will introduce:
 - `docs/principles.md` - non-negotiable design rules
 - `docs/failure-model.md` - what happens when things go wrong
 - `docs/phases.md` - development roadmap and phase discipline
+- `TESTING.md` - `go test` coverage commands and report viewing steps
 
 Read these before writing or reviewing code.
 

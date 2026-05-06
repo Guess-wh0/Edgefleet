@@ -85,6 +85,21 @@ go mod tidy
 
 ---
 
+## Run Tests
+
+From `control-plane/`:
+
+```powershell
+go test ./...
+go test ./... -coverprofile=coverage
+go tool cover -func=coverage
+go tool cover -html=coverage -o coverage.html
+```
+
+Open `coverage.html` in a browser to inspect detailed coverage.
+
+---
+
 ## Start the Control Plane
 
 Run directly:
@@ -245,8 +260,10 @@ curl http://localhost:8080/desired-state/<node-id> \
 Response:
 
 ```json
-{"version":4,"payload":"handler-check"}
+{"version":4,"payload":"handler-check","signature":"<hmac-signature>"}
 ```
+
+The control plane signs every desired state response with HMAC-SHA256 keyed by the node's secret. The edge verifies this signature before applying state.
 
 If no desired state exists yet, the response body is empty.
 
@@ -257,6 +274,8 @@ If no desired state exists yet, the response body is empty.
 ```text
 POST /debug/set-desired?nodeID={nodeID}&version={version}
 ```
+
+This endpoint is for development and testing only. It lets an authorized user inject desired state for a specific node.
 
 Requires Basic Auth.
 
@@ -339,7 +358,7 @@ desired_state (
 - Phase 4 in progress:
   - Edge identity and token auth: complete
   - Basic Auth on admin endpoints: complete
-  - Signed desired state: pending
+  - Signed desired state: complete
 
 ---
 

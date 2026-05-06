@@ -436,3 +436,38 @@ func TestEdgeRejectsInvalidDesiredStateSignature(t *testing.T) {
 		t.Fatalf("should not apply tampered desired state, got %q", logs)
 	}
 }
+
+func TestEdgeRejectsStaleDesiredStateReplay(t *testing.T) {
+	tempDir := t.TempDir()
+	logBuffer := withLogBuffer(t)
+
+	_, server := newFakeControlPlane(t, 4, "old-command")
+	withControlPlaneBase(t, server.URL)
+
+	state := PersistentState{
+		NodeID:             "node-1",
+		NodeSecret:         "secret-1",
+		LastAppliedVersion: 6,
+	}
+	withStateFile(t, filepath.Join(tempDir, stateFileName))
+	savePersistentState(state)
+
+	runOnce(&state)
+
+	if state.LastAppliedVersion != 6 {
+		t.Fatalf("in-memory version after stale replay = %d, want %d", state.LastAppliedVersion, 6)
+	}
+
+	persisted := loadPersistentState()
+	if persisted.LastAppliedVersion != 6 {
+		t.Fatalf("persisted version after stale replay = %d, want %d", persisted.LastAppliedVersion, 6)
+	}
+
+	logs := logBuffer.String()
+	if !strings.Contains(logs, "[RECONCILE] compare remote=4 local=6 result=stale") {
+		t.Fatalf("expected stale replay log, got %q", logs)
+	}
+	if strings.Contains(logs, "[RECONCILE] applying") {
+		t.Fatalf("should not apply stale desired state, got %q", logs)
+	}
+}
