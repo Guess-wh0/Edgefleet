@@ -18,6 +18,7 @@ type fakeControlPlane struct {
 	nodeID         string
 	nodeSecret     string
 	signingSecret  string
+	signingPayload string
 	registerCount  int
 	heartbeatNodes []string
 	desiredVersion int
@@ -74,10 +75,15 @@ func newFakeControlPlane(t *testing.T, desiredVersion int, desiredPayload string
 			return
 		}
 
+		signingPayload := cp.desiredPayload
+		if cp.signingPayload != "" {
+			signingPayload = cp.signingPayload
+		}
+
 		envelope := DesiredState{
 			Version:   cp.desiredVersion,
 			Payload:   cp.desiredPayload,
-			Signature: signDesiredState(cp.nodeID, cp.desiredVersion, cp.desiredPayload, cp.signingSecret),
+			Signature: signDesiredState(cp.nodeID, cp.desiredVersion, signingPayload, cp.signingSecret),
 		}
 
 		w.Header().Set("Content-Type", "application/json")
@@ -469,6 +475,79 @@ func TestEdgeRejectsStaleDesiredStateReplay(t *testing.T) {
 	}
 	if strings.Contains(logs, "[RECONCILE] applying") {
 		t.Fatalf("should not apply stale desired state, got %q", logs)
+	}
+}
+
+func TestAttackSimulationRejectsTamperedDesiredStatePayload(t *testing.T) {
+	tempDir := t.TempDir()
+	logBuffer := withLogBuffer(t)
+
+	cp, server := newFakeControlPlane(t, 9, "tampered-payload")
+	withControlPlaneBase(t, server.URL)
+
+	cp.mu.Lock()
+	cp.signingPayload = "trusted-payload"
+	cp.mu.Unlock()
+
+	state := PersistentState{
+		NodeID:     "node-1",
+		NodeSecret: "secret-1",
+	}
+	withStateFile(t, filepath.Join(tempDir, stateFileName))
+	savePersistentState(state)
+
+	runOnce(&state)
+
+	if state.LastAppliedVersion != 0 {
+		t.Fatalf("version after tampered payload = %d, want %d", state.LastAppliedVersion, 0)
+	}
+
+	persisted := loadPersistentState()
+	if persisted.LastAppliedVersion != 0 {
+		t.Fatalf("persisted version after tampered payload = %d, want %d", persisted.LastAppliedVersion, 0)
+	}
+
+	logs := logBuffer.String()
+	if !strings.Contains(logs, "[SECURITY][REJECT] desired-state invalid signature version=9") {
+		t.Fatalf("expected tampered payload reject log, got %q", logs)
+	}
+	if strings.Contains(logs, "[RECONCILE] applying") {
+		t.Fatalf("should not apply tampered payload, got %q", logs)
+	}
+}
+
+func TestAttackSimulationRejectsReplayOldDesiredState(t *testing.T) {
+	tempDir := t.TempDir()
+	logBuffer := withLogBuffer(t)
+
+	_, server := newFakeControlPlane(t, 3, "replayed-command")
+	withControlPlaneBase(t, server.URL)
+
+	state := PersistentState{
+		NodeID:             "node-1",
+		NodeSecret:         "secret-1",
+		LastAppliedVersion: 5,
+	}
+	withStateFile(t, filepath.Join(tempDir, stateFileName))
+	savePersistentState(state)
+
+	runOnce(&state)
+
+	if state.LastAppliedVersion != 5 {
+		t.Fatalf("version after replay attack = %d, want %d", state.LastAppliedVersion, 5)
+	}
+
+	persisted := loadPersistentState()
+	if persisted.LastAppliedVersion != 5 {
+		t.Fatalf("persisted version after replay attack = %d, want %d", persisted.LastAppliedVersion, 5)
+	}
+
+	logs := logBuffer.String()
+	if !strings.Contains(logs, "[RECONCILE] compare remote=3 local=5 result=stale") {
+		t.Fatalf("expected stale replay log, got %q", logs)
+	}
+	if strings.Contains(logs, "[RECONCILE] applying") {
+		t.Fatalf("should not apply replayed desired state, got %q", logs)
 	}
 }
 

@@ -314,6 +314,63 @@ func TestHeartbeatRejectsMissingNodeToken(t *testing.T) {
 	}
 }
 
+func TestAttackSimulationRejectsFakeNodeID(t *testing.T) {
+	withTempWorkingDir(t)
+	withControlPlaneBasicAuth(t, testControlPlaneUser, testControlPlanePassword)
+	logBuffer := withLogBuffer(t)
+
+	if err := initDB(); err != nil {
+		t.Fatalf("init db: %v", err)
+	}
+
+	mux := testMux()
+	resp := performRequest(t, mux, http.MethodPost, "/heartbeat", "", map[string]string{
+		"X-Node-ID":    "fake-node",
+		"X-Node-Token": "fake-token",
+	})
+	if resp.Code != http.StatusUnauthorized {
+		t.Fatalf("fake node status = %d, want %d", resp.Code, http.StatusUnauthorized)
+	}
+	if !strings.Contains(logBuffer.String(), "[AUTH][REJECT] path=/heartbeat reason=unknown-node presented_node=fake-node expected_node=fake-node") {
+		t.Fatalf("expected fake-node reject log, got %q", logBuffer.String())
+	}
+}
+
+func TestAttackSimulationRejectsWrongToken(t *testing.T) {
+	withTempWorkingDir(t)
+	withControlPlaneBasicAuth(t, testControlPlaneUser, testControlPlanePassword)
+	logBuffer := withLogBuffer(t)
+
+	if err := initDB(); err != nil {
+		t.Fatalf("init db: %v", err)
+	}
+
+	mux := testMux()
+	registerResp := performRequest(t, mux, http.MethodPost, "/register", "", map[string]string{
+		"X-Node-Hostname": "token-check-node",
+		"X-Node-Arch":     "amd64",
+	})
+	if registerResp.Code != http.StatusOK {
+		t.Fatalf("register status = %d, want %d", registerResp.Code, http.StatusOK)
+	}
+
+	var registration RegistrationResponse
+	if err := json.Unmarshal(registerResp.Body.Bytes(), &registration); err != nil {
+		t.Fatalf("decode register response: %v", err)
+	}
+
+	resp := performRequest(t, mux, http.MethodGet, "/desired-state/"+registration.NodeID, "", map[string]string{
+		"X-Node-ID":    registration.NodeID,
+		"X-Node-Token": "wrong-token",
+	})
+	if resp.Code != http.StatusUnauthorized {
+		t.Fatalf("wrong token status = %d, want %d", resp.Code, http.StatusUnauthorized)
+	}
+	if !strings.Contains(logBuffer.String(), "[AUTH][REJECT] path=/desired-state/"+registration.NodeID+" reason=invalid-node-token presented_node="+registration.NodeID+" expected_node="+registration.NodeID) {
+		t.Fatalf("expected wrong-token reject log, got %q", logBuffer.String())
+	}
+}
+
 func TestDesiredStateAcceptsValidNodeToken(t *testing.T) {
 	withTempWorkingDir(t)
 	withControlPlaneBasicAuth(t, testControlPlaneUser, testControlPlanePassword)
