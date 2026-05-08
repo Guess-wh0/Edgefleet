@@ -1,11 +1,18 @@
 package main
 
 import (
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"database/sql"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"strconv"
 	"time"
 
@@ -15,11 +22,14 @@ import (
 
 // Global DB variable
 var db *sql.DB
+var controlPlaneUser = getenv("CONTROL_PLANE_USER", "admin")
+var controlPlanePassword = getenv("CONTROL_PLANE_PASSWORD", "edgefleet")
 
 // constant to Standardize error messages
 const (
 	errMethodNotAllowed = "method not allowed"
 	errMissingNodeID    = "missing node id"
+	errMissingNodeToken = "missing node token"
 )
 
 const (
@@ -33,6 +43,17 @@ type Node struct {
 	NodeId        string `json:"node_id"`
 	LastHeartbeat string `json:"last_heartbeat"`
 	Status        string `json:"status"`
+}
+
+type RegistrationResponse struct {
+	NodeID     string `json:"node_id"`
+	NodeSecret string `json:"node_secret"`
+}
+
+type DesiredStateEnvelope struct {
+	Version   int    `json:"version"`
+	Payload   string `json:"payload"`
+	Signature string `json:"signature"`
 }
 
 // Helper method to validate request method
@@ -58,13 +79,117 @@ func nodeIdMissing(w http.ResponseWriter, nodeID string) bool {
 	return false
 }
 
+func nodeTokenMissing(w http.ResponseWriter, nodeToken string) bool {
+	if nodeToken == "" {
+		http.Error(w, errMissingNodeToken, http.StatusUnauthorized)
+		return true
+	}
+	return false
+}
+
+func logNodeAuthReject(r *http.Request, reason, presentedNodeID, expectedNodeID string) {
+	log.Printf(
+		"[AUTH][REJECT] path=%s reason=%s presented_node=%s expected_node=%s",
+		r.URL.Path,
+		reason,
+		presentedNodeID,
+		expectedNodeID,
+	)
+}
+
+func logUserAuthReject(r *http.Request, reason string) {
+	log.Printf("[USER_AUTH][REJECT] path=%s reason=%s", r.URL.Path, reason)
+}
+
+func generateNodeSecret() (string, error) {
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(buf), nil
+}
+
+func authenticateNodeRequest(w http.ResponseWriter, r *http.Request, expectedNodeID string) bool {
+	nodeID := r.Header.Get("X-Node-ID")
+	if nodeIdMissing(w, nodeID) {
+		logNodeAuthReject(r, "missing-node-id", nodeID, expectedNodeID)
+		return false
+	}
+	if expectedNodeID != "" && nodeID != expectedNodeID {
+		logNodeAuthReject(r, "node-id-mismatch", nodeID, expectedNodeID)
+		http.Error(w, "node id mismatch", http.StatusUnauthorized)
+		return false
+	}
+
+	nodeToken := r.Header.Get("X-Node-Token")
+	if nodeTokenMissing(w, nodeToken) {
+		logNodeAuthReject(r, "missing-node-token", nodeID, expectedNodeID)
+		return false
+	}
+
+	var storedToken string
+	err := db.QueryRow(`SELECT node_secret FROM nodes WHERE node_id = ?`, nodeID).Scan(&storedToken)
+	if err == sql.ErrNoRows {
+		logNodeAuthReject(r, "unknown-node", nodeID, expectedNodeID)
+		http.Error(w, "unknown node", http.StatusUnauthorized)
+		return false
+	}
+	if err != nil {
+		log.Printf("[AUTH][ERROR] path=%s node=%s err=%v", r.URL.Path, nodeID, err)
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return false
+	}
+	if storedToken == "" || subtle.ConstantTimeCompare([]byte(storedToken), []byte(nodeToken)) != 1 {
+		logNodeAuthReject(r, "invalid-node-token", nodeID, expectedNodeID)
+		http.Error(w, "invalid node token", http.StatusUnauthorized)
+		return false
+	}
+
+	return true
+}
+
+func signDesiredState(nodeID string, version int, payload, nodeSecret string) string {
+	mac := hmac.New(sha256.New, []byte(nodeSecret))
+	_, _ = mac.Write([]byte(fmt.Sprintf("%s\n%d\n%s", nodeID, version, payload)))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func getenv(key, def string) string {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	return v
+}
+
+func authenticateUserRequest(w http.ResponseWriter, r *http.Request) bool {
+	username, password, ok := r.BasicAuth()
+	if !ok {
+		logUserAuthReject(r, "missing-basic-auth")
+		w.Header().Set("WWW-Authenticate", `Basic realm="edgefleet-control-plane"`)
+		http.Error(w, "basic auth required", http.StatusUnauthorized)
+		return false
+	}
+
+	userMatch := subtle.ConstantTimeCompare([]byte(username), []byte(controlPlaneUser)) == 1
+	passwordMatch := subtle.ConstantTimeCompare([]byte(password), []byte(controlPlanePassword)) == 1
+	if !userMatch || !passwordMatch {
+		logUserAuthReject(r, "invalid-basic-auth")
+		w.Header().Set("WWW-Authenticate", `Basic realm="edgefleet-control-plane"`)
+		http.Error(w, "invalid credentials", http.StatusUnauthorized)
+		return false
+	}
+
+	return true
+}
+
 // heartbeat updates liveness metadata only.
 func heartbeatHandler(w http.ResponseWriter, r *http.Request) {
 	if !requireMethod(w, r, http.MethodPost) {
 		return
 	}
 	nodeID := r.Header.Get("X-Node-ID")
-	if nodeIdMissing(w, nodeID) {
+	if !authenticateNodeRequest(w, r, nodeID) {
 		return
 	}
 	res, err := db.Exec(
@@ -97,14 +222,20 @@ func registrationHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	nodeID := uuid.New().String()
+	nodeSecret, err := generateNodeSecret()
+	if err != nil {
+		http.Error(w, "failed to generate node secret", http.StatusInternalServerError)
+		return
+	}
 
 	hostname := r.Header.Get("X-Node-Hostname")
 	arch := r.Header.Get("X-Node-Arch")
 
-	_, err := db.Exec(
-		`INSERT INTO nodes (node_id, last_heartbeat, status, hostname, arch)
-		VALUES (?, ?, ?, ?, ?)`,
+	_, err = db.Exec(
+		`INSERT INTO nodes (node_id, node_secret, last_heartbeat, status, hostname, arch)
+		VALUES (?, ?, ?, ?, ?, ?)`,
 		nodeID,
+		nodeSecret,
 		time.Now().UTC(),
 		"registered",
 		hostname,
@@ -122,8 +253,12 @@ func registrationHandler(w http.ResponseWriter, r *http.Request) {
 		time.Now().Format(time.RFC3339),
 	)
 
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(nodeID))
+	_ = json.NewEncoder(w).Encode(RegistrationResponse{
+		NodeID:     nodeID,
+		NodeSecret: nodeSecret,
+	})
 }
 
 func getDesiredState(w http.ResponseWriter, r *http.Request) {
@@ -135,15 +270,20 @@ func getDesiredState(w http.ResponseWriter, r *http.Request) {
 	if nodeIdMissing(w, nodeID) {
 		return
 	}
+	if !authenticateNodeRequest(w, r, nodeID) {
+		return
+	}
 
 	var version int
 	var payload string
+	var nodeSecret string
 
 	err := db.QueryRow(`
-		SELECT version, payload
-		FROM desired_state
-		WHERE node_id = ?
-	`, nodeID).Scan(&version, &payload)
+		SELECT d.version, d.payload, n.node_secret
+		FROM desired_state d
+		JOIN nodes n ON n.node_id = d.node_id
+		WHERE d.node_id = ?
+	`, nodeID).Scan(&version, &payload, &nodeSecret)
 
 	if err == sql.ErrNoRows {
 		w.WriteHeader(http.StatusOK)
@@ -162,12 +302,22 @@ func getDesiredState(w http.ResponseWriter, r *http.Request) {
 		time.Now().Format(time.RFC3339),
 	)
 
+	envelope := DesiredStateEnvelope{
+		Version:   version,
+		Payload:   payload,
+		Signature: signDesiredState(nodeID, version, payload, nodeSecret),
+	}
+
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(payload))
+	_ = json.NewEncoder(w).Encode(envelope)
 }
 
 func getHealthDetail(w http.ResponseWriter, r *http.Request) {
 	if !requireMethod(w, r, http.MethodGet) {
+		return
+	}
+	if !authenticateUserRequest(w, r) {
 		return
 	}
 
@@ -206,6 +356,7 @@ func initDB() error {
 	_, err = db.Exec(`
 	CREATE TABLE IF NOT EXISTS nodes (
 		node_id TEXT PRIMARY KEY,
+		node_secret TEXT,
 		last_heartbeat TIMESTAMP,
 		status TEXT,
 		hostname TEXT,
@@ -214,6 +365,9 @@ func initDB() error {
 	`)
 
 	if err != nil {
+		return err
+	}
+	if err := ensureNodeSecretColumn(); err != nil {
 		return err
 	}
 
@@ -228,6 +382,33 @@ func initDB() error {
 	if err != nil {
 		return err
 	}
+	return err
+}
+
+func ensureNodeSecretColumn() error {
+	rows, err := db.Query(`PRAGMA table_info(nodes)`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var cid int
+		var name string
+		var dataType string
+		var notNull int
+		var defaultValue any
+		var pk int
+
+		if err := rows.Scan(&cid, &name, &dataType, &notNull, &defaultValue, &pk); err != nil {
+			return err
+		}
+		if name == "node_secret" {
+			return nil
+		}
+	}
+
+	_, err = db.Exec(`ALTER TABLE nodes ADD COLUMN node_secret TEXT`)
 	return err
 }
 
@@ -287,6 +468,13 @@ func livenessSweep() {
 }
 
 func listNodes(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodGet) {
+		return
+	}
+	if !authenticateUserRequest(w, r) {
+		return
+	}
+
 	rows, err := db.Query(`
 		SELECT node_id, status, last_heartbeat
 		FROM nodes
@@ -313,6 +501,9 @@ func listNodes(w http.ResponseWriter, r *http.Request) {
 // for development stress testing only
 func setDesiredState(w http.ResponseWriter, r *http.Request) {
 	if !requireMethod(w, r, http.MethodPost) {
+		return
+	}
+	if !authenticateUserRequest(w, r) {
 		return
 	}
 

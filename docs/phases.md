@@ -130,7 +130,8 @@ Prevent accidental or malicious misuse.
 ### What is built
 - Edge identity & registration
 - Signed desired state
-- Basic auth between edge and control plane
+- Token-authenticated edge requests
+- Basic Auth for user/admin access to the control plane
 - Rejection of untrusted commands
 
 ### What is explicitly NOT done

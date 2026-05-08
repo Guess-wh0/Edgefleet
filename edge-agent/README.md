@@ -19,6 +19,8 @@ Specifically, it:
 - Executes workloads based on the **last known desired state**
 - Continues operating even when the control plane is unavailable
 - Maintains local runtime state in `state.json`
+- Stores its assigned `node_id` and `node_secret` locally
+- Verifies signed desired state before applying it
 - Enforces local safety constraints (CPU, memory, basic sanity checks)
 - Initiates all communication with the control plane (pull-based)
 
@@ -51,6 +53,7 @@ The edge node reports **facts**, not opinions.
 It reports:
 
 - Node identity (assigned by control plane)
+- Node authentication token on each request
 - Heartbeats (liveness signals)
 - Last applied desired state version
 - Actual execution status
@@ -94,6 +97,21 @@ Crossing it is a bug.
 
 ---
 
+## Run Tests
+
+From `edge-agent/`:
+
+```powershell
+go test ./...
+go test ./... -coverprofile=coverage
+go tool cover -func=coverage
+go tool cover -html=coverage -o coverage.html
+```
+
+Open `coverage.html` in a browser to inspect detailed coverage.
+
+---
+
 ## Start the Edge Agent
 
 Run directly:
@@ -111,4 +129,14 @@ go build -o edge-agent
 to run multiple nodes run below in separate terminal with diff node names
 ```bash
 $env:EDGE_NODE_DIR=".\nodeA"; $env:EDGE_HEARTBEAT_SEC="5"; $env:EDGE_HOSTNAME="node-A"; .\edge-agent.exe
+```
+
+The edge stores identity like this:
+
+```json
+{
+  "node_id": "f2d8d2c8-...",
+  "node_secret": "8c9d...",
+  "last_applied_desired_state_version": 4
+}
 ```

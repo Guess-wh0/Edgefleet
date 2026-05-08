@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"log"
 	"net/http"
 	"net/http/httptest"
@@ -15,17 +16,24 @@ import (
 type fakeControlPlane struct {
 	mu             sync.Mutex
 	nodeID         string
+	nodeSecret     string
+	signingSecret  string
+	signingPayload string
 	registerCount  int
 	heartbeatNodes []string
-	desiredBody    string
+	desiredVersion int
+	desiredPayload string
 }
 
-func newFakeControlPlane(t *testing.T, desiredBody string) (*fakeControlPlane, *httptest.Server) {
+func newFakeControlPlane(t *testing.T, desiredVersion int, desiredPayload string) (*fakeControlPlane, *httptest.Server) {
 	t.Helper()
 
 	cp := &fakeControlPlane{
-		nodeID:      "node-1",
-		desiredBody: desiredBody,
+		nodeID:         "node-1",
+		nodeSecret:     "secret-1",
+		signingSecret:  "secret-1",
+		desiredVersion: desiredVersion,
+		desiredPayload: desiredPayload,
 	}
 
 	mux := http.NewServeMux()
@@ -34,8 +42,9 @@ func newFakeControlPlane(t *testing.T, desiredBody string) (*fakeControlPlane, *
 		defer cp.mu.Unlock()
 
 		cp.registerCount++
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(cp.nodeID))
+		_, _ = w.Write([]byte(`{"node_id":"` + cp.nodeID + `","node_secret":"` + cp.nodeSecret + `"}`))
 	})
 
 	mux.HandleFunc("/heartbeat", func(w http.ResponseWriter, r *http.Request) {
@@ -44,8 +53,9 @@ func newFakeControlPlane(t *testing.T, desiredBody string) (*fakeControlPlane, *
 
 		nodeID := r.Header.Get("X-Node-ID")
 		cp.heartbeatNodes = append(cp.heartbeatNodes, nodeID)
-		if nodeID != cp.nodeID {
-			http.Error(w, "unknown node", http.StatusBadRequest)
+		nodeToken := r.Header.Get("X-Node-Token")
+		if nodeID != cp.nodeID || nodeToken != cp.nodeSecret {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
 
@@ -58,13 +68,27 @@ func newFakeControlPlane(t *testing.T, desiredBody string) (*fakeControlPlane, *
 		defer cp.mu.Unlock()
 
 		nodeID := strings.TrimPrefix(r.URL.Path, "/desired-state/")
-		if nodeID != cp.nodeID {
-			w.WriteHeader(http.StatusOK)
+		nodeToken := r.Header.Get("X-Node-Token")
+		headerNodeID := r.Header.Get("X-Node-ID")
+		if nodeID != cp.nodeID || headerNodeID != cp.nodeID || nodeToken != cp.nodeSecret {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
 
+		signingPayload := cp.desiredPayload
+		if cp.signingPayload != "" {
+			signingPayload = cp.signingPayload
+		}
+
+		envelope := DesiredState{
+			Version:   cp.desiredVersion,
+			Payload:   cp.desiredPayload,
+			Signature: signDesiredState(cp.nodeID, cp.desiredVersion, signingPayload, cp.signingSecret),
+		}
+
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(cp.desiredBody))
+		_ = json.NewEncoder(w).Encode(envelope)
 	})
 
 	server := httptest.NewServer(mux)
@@ -120,6 +144,7 @@ func TestSaveAndLoadPersistentState(t *testing.T) {
 
 	expected := PersistentState{
 		NodeID:             "node-123",
+		NodeSecret:         "secret-123",
 		LastAppliedVersion: 7,
 	}
 
@@ -161,6 +186,7 @@ func TestLoadPersistentStatePrefersJSONState(t *testing.T) {
 
 	savePersistentState(PersistentState{
 		NodeID:             "json-node",
+		NodeSecret:         "secret-json",
 		LastAppliedVersion: 21,
 	})
 
@@ -180,11 +206,44 @@ func TestLoadPersistentStatePrefersJSONState(t *testing.T) {
 	}
 }
 
+func TestInitializeLocalStateReregistersWhenSecretMissing(t *testing.T) {
+	tempDir := t.TempDir()
+	logBuffer := withLogBuffer(t)
+
+	cp, server := newFakeControlPlane(t, 1, "secure-bootstrap")
+	withControlPlaneBase(t, server.URL)
+
+	withStateFile(t, filepath.Join(tempDir, stateFileName))
+	savePersistentState(PersistentState{
+		NodeID:             "legacy-node",
+		LastAppliedVersion: 2,
+	})
+
+	state := initializeLocalState(tempDir)
+	if state.NodeID != "node-1" {
+		t.Fatalf("reregistered node id = %q, want %q", state.NodeID, "node-1")
+	}
+	if state.NodeSecret != "secret-1" {
+		t.Fatalf("reregistered node secret = %q, want %q", state.NodeSecret, "secret-1")
+	}
+
+	cp.mu.Lock()
+	registerCount := cp.registerCount
+	cp.mu.Unlock()
+
+	if registerCount != 1 {
+		t.Fatalf("register count = %d, want %d", registerCount, 1)
+	}
+	if !strings.Contains(logBuffer.String(), "[STATE] missing node secret for node=legacy-node; registering again") {
+		t.Fatalf("expected missing-secret log, got %q", logBuffer.String())
+	}
+}
+
 func TestEdgeRestartReusesNodeIDAndReconcilesIdempotently(t *testing.T) {
 	tempDir := t.TempDir()
 	logBuffer := withLogBuffer(t)
 
-	cp, server := newFakeControlPlane(t, `{"version":4,"payload":"restart-drill"}`)
+	cp, server := newFakeControlPlane(t, 4, "restart-drill")
 	withControlPlaneBase(t, server.URL)
 
 	firstStart := initializeLocalState(tempDir)
@@ -197,6 +256,9 @@ func TestEdgeRestartReusesNodeIDAndReconcilesIdempotently(t *testing.T) {
 	persistedAfterFirstStart := loadPersistentState()
 	if persistedAfterFirstStart.NodeID != "node-1" {
 		t.Fatalf("persisted node id after first start = %q, want %q", persistedAfterFirstStart.NodeID, "node-1")
+	}
+	if persistedAfterFirstStart.NodeSecret != "secret-1" {
+		t.Fatalf("persisted node secret after first start = %q, want %q", persistedAfterFirstStart.NodeSecret, "secret-1")
 	}
 	if persistedAfterFirstStart.LastAppliedVersion != 4 {
 		t.Fatalf("persisted version after first start = %d, want %d", persistedAfterFirstStart.LastAppliedVersion, 4)
@@ -215,6 +277,9 @@ func TestEdgeRestartReusesNodeIDAndReconcilesIdempotently(t *testing.T) {
 	secondStart := initializeLocalState(tempDir)
 	if secondStart.NodeID != firstStart.NodeID {
 		t.Fatalf("restart node id = %q, want %q", secondStart.NodeID, firstStart.NodeID)
+	}
+	if secondStart.NodeSecret != firstStart.NodeSecret {
+		t.Fatalf("restart node secret changed")
 	}
 
 	runOnce(&secondStart)
@@ -239,6 +304,9 @@ func TestEdgeRestartReusesNodeIDAndReconcilesIdempotently(t *testing.T) {
 	persistedAfterRestart := loadPersistentState()
 	if persistedAfterRestart.NodeID != "node-1" {
 		t.Fatalf("persisted node id after restart = %q, want %q", persistedAfterRestart.NodeID, "node-1")
+	}
+	if persistedAfterRestart.NodeSecret != "secret-1" {
+		t.Fatalf("persisted node secret after restart = %q, want %q", persistedAfterRestart.NodeSecret, "secret-1")
 	}
 	if persistedAfterRestart.LastAppliedVersion != 4 {
 		t.Fatalf("persisted version after restart = %d, want %d", persistedAfterRestart.LastAppliedVersion, 4)
@@ -266,7 +334,7 @@ func TestEdgeRestartDetectsDriftAndAppliesUpdatedDesiredStateOnce(t *testing.T) 
 	tempDir := t.TempDir()
 	logBuffer := withLogBuffer(t)
 
-	cp, server := newFakeControlPlane(t, `{"version":4,"payload":"before-offline"}`)
+	cp, server := newFakeControlPlane(t, 4, "before-offline")
 	withControlPlaneBase(t, server.URL)
 
 	firstStart := initializeLocalState(tempDir)
@@ -281,7 +349,8 @@ func TestEdgeRestartDetectsDriftAndAppliesUpdatedDesiredStateOnce(t *testing.T) 
 	}
 
 	cp.mu.Lock()
-	cp.desiredBody = `{"version":5,"payload":"after-offline"}`
+	cp.desiredVersion = 5
+	cp.desiredPayload = "after-offline"
 	cp.mu.Unlock()
 
 	logBuffer.Reset()
@@ -289,6 +358,9 @@ func TestEdgeRestartDetectsDriftAndAppliesUpdatedDesiredStateOnce(t *testing.T) 
 	secondStart := initializeLocalState(tempDir)
 	if secondStart.NodeID != "node-1" {
 		t.Fatalf("restart node id = %q, want %q", secondStart.NodeID, "node-1")
+	}
+	if secondStart.NodeSecret != "secret-1" {
+		t.Fatalf("restart node secret = %q, want %q", secondStart.NodeSecret, "secret-1")
 	}
 	if secondStart.LastAppliedVersion != 4 {
 		t.Fatalf("restart local version = %d, want %d", secondStart.LastAppliedVersion, 4)
@@ -312,6 +384,9 @@ func TestEdgeRestartDetectsDriftAndAppliesUpdatedDesiredStateOnce(t *testing.T) 
 	if persisted.NodeID != "node-1" {
 		t.Fatalf("persisted node id after drift restart = %q, want %q", persisted.NodeID, "node-1")
 	}
+	if persisted.NodeSecret != "secret-1" {
+		t.Fatalf("persisted node secret after drift restart = %q, want %q", persisted.NodeSecret, "secret-1")
+	}
 	if persisted.LastAppliedVersion != 5 {
 		t.Fatalf("persisted version after drift restart = %d, want %d", persisted.LastAppliedVersion, 5)
 	}
@@ -331,5 +406,219 @@ func TestEdgeRestartDetectsDriftAndAppliesUpdatedDesiredStateOnce(t *testing.T) 
 	}
 	if strings.Contains(secondLogs, "[REGISTER]") {
 		t.Fatalf("restart logs should not register again, got %q", secondLogs)
+	}
+}
+
+func TestEdgeRejectsInvalidDesiredStateSignature(t *testing.T) {
+	tempDir := t.TempDir()
+	logBuffer := withLogBuffer(t)
+
+	cp, server := newFakeControlPlane(t, 7, "tampered")
+	withControlPlaneBase(t, server.URL)
+
+	cp.mu.Lock()
+	cp.signingSecret = "control-plane-secret"
+	cp.mu.Unlock()
+
+	state := PersistentState{
+		NodeID:     "node-1",
+		NodeSecret: "secret-1",
+	}
+	withStateFile(t, filepath.Join(tempDir, stateFileName))
+	savePersistentState(state)
+
+	runOnce(&state)
+
+	persisted := loadPersistentState()
+	if persisted.LastAppliedVersion != 0 {
+		t.Fatalf("persisted version after invalid signature = %d, want %d", persisted.LastAppliedVersion, 0)
+	}
+
+	logs := logBuffer.String()
+	if !strings.Contains(logs, "[RECONCILE] invalid signature version=7") {
+		t.Fatalf("expected invalid signature log, got %q", logs)
+	}
+	if strings.Contains(logs, "[RECONCILE] applying") {
+		t.Fatalf("should not apply tampered desired state, got %q", logs)
+	}
+}
+
+func TestEdgeRejectsStaleDesiredStateReplay(t *testing.T) {
+	tempDir := t.TempDir()
+	logBuffer := withLogBuffer(t)
+
+	_, server := newFakeControlPlane(t, 4, "old-command")
+	withControlPlaneBase(t, server.URL)
+
+	state := PersistentState{
+		NodeID:             "node-1",
+		NodeSecret:         "secret-1",
+		LastAppliedVersion: 6,
+	}
+	withStateFile(t, filepath.Join(tempDir, stateFileName))
+	savePersistentState(state)
+
+	runOnce(&state)
+
+	if state.LastAppliedVersion != 6 {
+		t.Fatalf("in-memory version after stale replay = %d, want %d", state.LastAppliedVersion, 6)
+	}
+
+	persisted := loadPersistentState()
+	if persisted.LastAppliedVersion != 6 {
+		t.Fatalf("persisted version after stale replay = %d, want %d", persisted.LastAppliedVersion, 6)
+	}
+
+	logs := logBuffer.String()
+	if !strings.Contains(logs, "[RECONCILE] compare remote=4 local=6 result=stale") {
+		t.Fatalf("expected stale replay log, got %q", logs)
+	}
+	if strings.Contains(logs, "[RECONCILE] applying") {
+		t.Fatalf("should not apply stale desired state, got %q", logs)
+	}
+}
+
+func TestAttackSimulationRejectsTamperedDesiredStatePayload(t *testing.T) {
+	tempDir := t.TempDir()
+	logBuffer := withLogBuffer(t)
+
+	cp, server := newFakeControlPlane(t, 9, "tampered-payload")
+	withControlPlaneBase(t, server.URL)
+
+	cp.mu.Lock()
+	cp.signingPayload = "trusted-payload"
+	cp.mu.Unlock()
+
+	state := PersistentState{
+		NodeID:     "node-1",
+		NodeSecret: "secret-1",
+	}
+	withStateFile(t, filepath.Join(tempDir, stateFileName))
+	savePersistentState(state)
+
+	runOnce(&state)
+
+	if state.LastAppliedVersion != 0 {
+		t.Fatalf("version after tampered payload = %d, want %d", state.LastAppliedVersion, 0)
+	}
+
+	persisted := loadPersistentState()
+	if persisted.LastAppliedVersion != 0 {
+		t.Fatalf("persisted version after tampered payload = %d, want %d", persisted.LastAppliedVersion, 0)
+	}
+
+	logs := logBuffer.String()
+	if !strings.Contains(logs, "[SECURITY][REJECT] desired-state invalid signature version=9") {
+		t.Fatalf("expected tampered payload reject log, got %q", logs)
+	}
+	if strings.Contains(logs, "[RECONCILE] applying") {
+		t.Fatalf("should not apply tampered payload, got %q", logs)
+	}
+}
+
+func TestAttackSimulationRejectsReplayOldDesiredState(t *testing.T) {
+	tempDir := t.TempDir()
+	logBuffer := withLogBuffer(t)
+
+	_, server := newFakeControlPlane(t, 3, "replayed-command")
+	withControlPlaneBase(t, server.URL)
+
+	state := PersistentState{
+		NodeID:             "node-1",
+		NodeSecret:         "secret-1",
+		LastAppliedVersion: 5,
+	}
+	withStateFile(t, filepath.Join(tempDir, stateFileName))
+	savePersistentState(state)
+
+	runOnce(&state)
+
+	if state.LastAppliedVersion != 5 {
+		t.Fatalf("version after replay attack = %d, want %d", state.LastAppliedVersion, 5)
+	}
+
+	persisted := loadPersistentState()
+	if persisted.LastAppliedVersion != 5 {
+		t.Fatalf("persisted version after replay attack = %d, want %d", persisted.LastAppliedVersion, 5)
+	}
+
+	logs := logBuffer.String()
+	if !strings.Contains(logs, "[RECONCILE] compare remote=3 local=5 result=stale") {
+		t.Fatalf("expected stale replay log, got %q", logs)
+	}
+	if strings.Contains(logs, "[RECONCILE] applying") {
+		t.Fatalf("should not apply replayed desired state, got %q", logs)
+	}
+}
+
+func TestEdgeInvalidSignatureDoesNotBreakLaterValidReconcile(t *testing.T) {
+	tempDir := t.TempDir()
+	logBuffer := withLogBuffer(t)
+
+	cp, server := newFakeControlPlane(t, 7, "tampered-first")
+	withControlPlaneBase(t, server.URL)
+
+	cp.mu.Lock()
+	cp.signingSecret = "wrong-secret"
+	cp.mu.Unlock()
+
+	state := PersistentState{
+		NodeID:     "node-1",
+		NodeSecret: "secret-1",
+	}
+	withStateFile(t, filepath.Join(tempDir, stateFileName))
+	savePersistentState(state)
+
+	runOnce(&state)
+
+	if state.LastAppliedVersion != 0 {
+		t.Fatalf("version after invalid signature = %d, want %d", state.LastAppliedVersion, 0)
+	}
+
+	firstLogs := logBuffer.String()
+	if !strings.Contains(firstLogs, "[SECURITY][REJECT] desired-state invalid signature version=7") {
+		t.Fatalf("expected security reject log, got %q", firstLogs)
+	}
+	if strings.Contains(firstLogs, "[RECONCILE] success version=7") {
+		t.Fatalf("should not report success for invalid signature, got %q", firstLogs)
+	}
+
+	cp.mu.Lock()
+	cp.signingSecret = cp.nodeSecret
+	cp.desiredVersion = 8
+	cp.desiredPayload = "trusted-now"
+	registerCount := cp.registerCount
+	cp.mu.Unlock()
+
+	if registerCount != 0 {
+		t.Fatalf("unexpected register count before recovery = %d, want %d", registerCount, 0)
+	}
+
+	logBuffer.Reset()
+	runOnce(&state)
+
+	if state.LastAppliedVersion != 8 {
+		t.Fatalf("version after recovery reconcile = %d, want %d", state.LastAppliedVersion, 8)
+	}
+
+	persisted := loadPersistentState()
+	if persisted.LastAppliedVersion != 8 {
+		t.Fatalf("persisted version after recovery reconcile = %d, want %d", persisted.LastAppliedVersion, 8)
+	}
+
+	cp.mu.Lock()
+	heartbeatCount := len(cp.heartbeatNodes)
+	cp.mu.Unlock()
+
+	if heartbeatCount != 2 {
+		t.Fatalf("heartbeat count across reject and recovery = %d, want %d", heartbeatCount, 2)
+	}
+
+	secondLogs := logBuffer.String()
+	if !strings.Contains(secondLogs, "[RECONCILE] compare remote=8 local=0 result=drift") {
+		t.Fatalf("expected drift log on recovery, got %q", secondLogs)
+	}
+	if !strings.Contains(secondLogs, "[RECONCILE] success version=8") {
+		t.Fatalf("expected successful reconcile after recovery, got %q", secondLogs)
 	}
 }
