@@ -6,7 +6,7 @@ No phase is skipped. No phase is diluted.
 
 ---
 
-## Phase 0 — Foundations (Thinking Before Code)
+## Phase 0 - Foundations (Thinking Before Code)
 
 ### Goal
 Freeze the mental model of EdgeFleet before implementation.
@@ -21,18 +21,18 @@ Freeze the mental model of EdgeFleet before implementation.
 ### What is explicitly NOT done
 - No code
 - No diagrams
-- No abstractions for “future scale”
+- No abstractions for "future scale"
 
 ### Exit criteria
 - `architecture.md`, `principles.md`, `failure-model.md`, `phases.md` exist
 - You can explain EdgeFleet **verbally** in under 3 minutes
 - Failure behavior is fully defined
 
-> If it’s not written, it doesn’t exist.
+> If it's not written, it doesn't exist.
 
 ---
 
-## Phase 1 — Single Node, Single Control Plane
+## Phase 1 - Single Node, Single Control Plane
 
 ### Goal
 Prove the core pull-based model works end-to-end.
@@ -62,7 +62,7 @@ Prove the core pull-based model works end-to-end.
 
 ---
 
-## Phase 2 — Multiple Edge Nodes
+## Phase 2 - Multiple Edge Nodes
 
 ### Goal
 Validate EdgeFleet as a coordination system, not a toy.
@@ -90,7 +90,7 @@ Validate EdgeFleet as a coordination system, not a toy.
 
 ---
 
-## Phase 3 — Robustness & Persistence
+## Phase 3 - Robustness & Persistence
 
 ### Goal
 Make EdgeFleet survive restarts and long outages.
@@ -117,7 +117,7 @@ Make EdgeFleet survive restarts and long outages.
 
 ---
 
-## Phase 4 — Security & Guardrails
+## Phase 4 - Security & Guardrails
 
 ### Goal
 Prevent accidental or malicious misuse.
@@ -145,7 +145,37 @@ Prevent accidental or malicious misuse.
 
 ---
 
-## Phase 5 — Extensibility (Only If Needed)
+## Phase 4.5 - Observability
+
+### Goal
+Make system behavior visible before extensibility adds more moving parts.
+
+### Scope
+- Structured logging
+- Event categorization
+- Minimal local log retention
+
+### What is built
+- JSON line logs for edge agent and control plane
+- Append-only local log files
+- System logs for startup, shutdown, and errors
+- Reconciliation logs for desired vs observed state and decisions taken
+- Execution logs for workload action lifecycle hooks
+
+### What is explicitly NOT done
+- No centralized log aggregation
+- No metrics backend
+- No tracing system
+
+### Exit criteria
+- Every emitted log includes `timestamp`, `event`, `component`, `process`, `status`, and `context`
+- Edge agent writes to `edge-agent/logs/agent.log`
+- Control plane writes to `control-plane/logs/control.log`
+- Reconciliation decisions are visible without debugger-only inspection
+
+---
+
+## Phase 5 - Extensibility (Only If Needed)
 
 ### Goal
 Allow EdgeFleet to grow without collapsing its core.

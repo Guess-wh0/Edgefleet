@@ -11,15 +11,19 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
 var controlPlaneBase = "http://localhost:8080"
 
 const stateFileName = "state.json"
+const workloadsFileName = "workloads.json"
 
 var stateFile = ""
 
@@ -40,6 +44,17 @@ type PersistentState struct {
 	LastAppliedVersion int    `json:"last_applied_desired_state_version"`
 }
 
+type workloadCommand struct {
+	Action     string `json:"action"`
+	WorkloadID string `json:"workload_id"`
+	Payload    string `json:"payload"`
+	Fail       bool   `json:"fail"`
+}
+
+type workloadState struct {
+	Active []string `json:"active"`
+}
+
 func isSecurityFailureStatus(statusCode int) bool {
 	return statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden
 }
@@ -55,19 +70,120 @@ func verifyDesiredStateSignature(state PersistentState, ds DesiredState) bool {
 	return hmac.Equal([]byte(expected), []byte(ds.Signature))
 }
 
+func workloadStatePath() string {
+	return filepath.Join(filepath.Dir(stateFile), workloadsFileName)
+}
+
+func currentLoopRetrySec() int {
+	return getenvInt("EDGE_HEARTBEAT_SEC", 10)
+}
+
+func loadWorkloadState() (workloadState, error) {
+	path := workloadStatePath()
+	data, err := os.ReadFile(path)
+	if err == nil {
+		var state workloadState
+		if err := json.Unmarshal(data, &state); err != nil {
+			return workloadState{}, err
+		}
+		sort.Strings(state.Active)
+		return state, nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return workloadState{}, nil
+	}
+	return workloadState{}, err
+}
+
+func saveWorkloadState(state workloadState) error {
+	sort.Strings(state.Active)
+	data, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	return os.WriteFile(workloadStatePath(), data, 0644)
+}
+
+func hasWorkload(state workloadState, workloadID string) bool {
+	for _, active := range state.Active {
+		if active == workloadID {
+			return true
+		}
+	}
+	return false
+}
+
+func addWorkload(state workloadState, workloadID string) workloadState {
+	if hasWorkload(state, workloadID) {
+		return state
+	}
+	state.Active = append(state.Active, workloadID)
+	sort.Strings(state.Active)
+	return state
+}
+
+func removeWorkload(state workloadState, workloadID string) workloadState {
+	var active []string
+	for _, workload := range state.Active {
+		if workload != workloadID {
+			active = append(active, workload)
+		}
+	}
+	state.Active = active
+	return state
+}
+
+func parseWorkloadCommand(payload string) (workloadCommand, error) {
+	trimmed := strings.TrimSpace(payload)
+	if trimmed == "" {
+		return workloadCommand{}, errors.New("empty desired state payload")
+	}
+
+	var command workloadCommand
+	if err := json.Unmarshal([]byte(trimmed), &command); err == nil {
+		if command.WorkloadID == "" && command.Payload != "" {
+			command.WorkloadID = command.Payload
+		}
+		if command.Action == "" {
+			command.Action = "start"
+		}
+		if strings.TrimSpace(command.WorkloadID) == "" {
+			return workloadCommand{}, errors.New("missing workload_id")
+		}
+		command.Action = strings.ToLower(strings.TrimSpace(command.Action))
+		command.WorkloadID = strings.TrimSpace(command.WorkloadID)
+		return command, nil
+	}
+
+	return workloadCommand{
+		Action:     "start",
+		WorkloadID: trimmed,
+		Payload:    trimmed,
+	}, nil
+}
+
 func loadPersistentState() PersistentState {
 	data, err := os.ReadFile(stateFile)
 	if err == nil {
 		var state PersistentState
 		if err := json.Unmarshal(data, &state); err != nil {
-			log.Printf("state file unreadable: %v", err)
+			logSystem("edge-agent.state", "state_load_failed", "error", map[string]any{
+				"state_file": stateFile,
+				"reason":     err.Error(),
+				"retryable":  false,
+			}, fmt.Sprintf("state file unreadable: %v", err))
 			return PersistentState{}
 		}
 		return state
 	}
 
 	if !errors.Is(err, os.ErrNotExist) {
-		log.Printf("state file read error: %v", err)
+		logSystem("edge-agent.state", "state_load_failed", "error", map[string]any{
+			"state_file": stateFile,
+			"reason":     err.Error(),
+			"retryable":  false,
+		}, fmt.Sprintf("state file read error: %v", err))
 		return PersistentState{}
 	}
 
@@ -77,7 +193,11 @@ func loadPersistentState() PersistentState {
 func savePersistentState(state PersistentState) {
 	data, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
-		log.Printf("state marshal error: %v", err)
+		logSystem("edge-agent.state", "state_save_failed", "error", map[string]any{
+			"state_file": stateFile,
+			"reason":     err.Error(),
+			"retryable":  false,
+		}, fmt.Sprintf("state marshal error: %v", err))
 		return
 	}
 
@@ -85,14 +205,22 @@ func savePersistentState(state PersistentState) {
 	data = append(data, '\n')
 
 	if err := os.WriteFile(tempFile, data, 0644); err != nil {
-		log.Printf("state write error: %v", err)
+		logSystem("edge-agent.state", "state_save_failed", "error", map[string]any{
+			"state_file": tempFile,
+			"reason":     err.Error(),
+			"retryable":  false,
+		}, fmt.Sprintf("state write error: %v", err))
 		return
 	}
 
 	if err := os.Rename(tempFile, stateFile); err != nil {
 		_ = os.Remove(stateFile)
 		if err := os.Rename(tempFile, stateFile); err != nil {
-			log.Printf("state replace error: %v", err)
+			logSystem("edge-agent.state", "state_save_failed", "error", map[string]any{
+				"state_file": stateFile,
+				"reason":     err.Error(),
+				"retryable":  false,
+			}, fmt.Sprintf("state replace error: %v", err))
 			_ = os.Remove(tempFile)
 		}
 	}
@@ -109,7 +237,6 @@ func migrateLegacyState() PersistentState {
 	}
 
 	savePersistentState(state)
-	log.Printf("[STATE] migrated legacy local state into %s", stateFileName)
 
 	return state
 }
@@ -155,15 +282,30 @@ func registerNode() PersistentState {
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
+		logSystem("edge-agent.bootstrap", "node_registration", "error", map[string]any{
+			"control_plane": controlPlaneBase,
+			"reason":        err.Error(),
+			"retryable":     false,
+		}, fmt.Sprintf("registration failed: %v", err))
 		log.Fatal("registration failed:", err)
 	}
 	defer resp.Body.Close()
 
 	var registration RegistrationResponse
 	if err := json.NewDecoder(resp.Body).Decode(&registration); err != nil {
+		logSystem("edge-agent.bootstrap", "node_registration", "error", map[string]any{
+			"control_plane": controlPlaneBase,
+			"reason":        err.Error(),
+			"retryable":     false,
+		}, fmt.Sprintf("registration decode failed: %v", err))
 		log.Fatal("registration decode failed:", err)
 	}
 	if registration.NodeID == "" || registration.NodeSecret == "" {
+		logSystem("edge-agent.bootstrap", "node_registration", "error", map[string]any{
+			"control_plane": controlPlaneBase,
+			"reason":        "incomplete node identity",
+			"retryable":     false,
+		}, "registration returned incomplete node identity")
 		log.Fatal("registration returned incomplete node identity")
 	}
 
@@ -172,7 +314,9 @@ func registerNode() PersistentState {
 		NodeSecret: registration.NodeSecret,
 	}
 	savePersistentState(state)
-	log.Printf("[REGISTER] node=%s", registration.NodeID)
+	logSystem("edge-agent.bootstrap", "node_registration", "success", map[string]any{
+		"node_id": registration.NodeID,
+	}, fmt.Sprintf("[REGISTER] node=%s", registration.NodeID))
 
 	return state
 }
@@ -188,7 +332,12 @@ func sendHeartbeat(state PersistentState) {
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		log.Println("heartbeat error:", err)
+		logSystem("edge-agent.heartbeat", "heartbeat_failed", "error", map[string]any{
+			"node_id":      state.NodeID,
+			"reason":       err.Error(),
+			"retryable":    true,
+			"retry_in_sec": currentLoopRetrySec(),
+		}, fmt.Sprintf("heartbeat error: %v", err))
 		return
 	}
 	defer resp.Body.Close()
@@ -196,14 +345,28 @@ func sendHeartbeat(state PersistentState) {
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		if isSecurityFailureStatus(resp.StatusCode) {
-			log.Printf("[SECURITY][REJECT] heartbeat status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(body)))
+			logSystem("edge-agent.heartbeat", "heartbeat_failed", "rejected", map[string]any{
+				"node_id":      state.NodeID,
+				"http_status":  resp.StatusCode,
+				"reason":       strings.TrimSpace(string(body)),
+				"retryable":    true,
+				"retry_in_sec": currentLoopRetrySec(),
+			}, fmt.Sprintf("[SECURITY][REJECT] heartbeat status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(body))))
 			return
 		}
-		log.Printf("heartbeat rejected: status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(body)))
+		logSystem("edge-agent.heartbeat", "heartbeat_failed", "rejected", map[string]any{
+			"node_id":      state.NodeID,
+			"http_status":  resp.StatusCode,
+			"reason":       strings.TrimSpace(string(body)),
+			"retryable":    true,
+			"retry_in_sec": currentLoopRetrySec(),
+		}, fmt.Sprintf("heartbeat rejected: status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(body))))
 		return
 	}
 
-	log.Printf("[HEARTBEAT] sent node=%s", state.NodeID)
+	logSystem("edge-agent.heartbeat", "heartbeat_sent", "success", map[string]any{
+		"node_id": state.NodeID,
+	}, fmt.Sprintf("[HEARTBEAT] sent node=%s", state.NodeID))
 }
 
 func getenv(key, def string) string {
@@ -256,15 +419,162 @@ func fetchDesiredState(state PersistentState) (*DesiredState, error) {
 	if err != nil {
 		return nil, err
 	}
-	log.Printf("[fetched_state] version=%d",
-		ds.Version)
+	logReconciliation("edge-agent.reconcile", "desired_state_fetched", "success", map[string]any{
+		"node_id": state.NodeID,
+		"version": ds.Version,
+	}, fmt.Sprintf("[fetched_state] version=%d", ds.Version))
 	return &ds, nil
+}
+
+func applyDesiredState(state *PersistentState, ds DesiredState) error {
+	command, err := parseWorkloadCommand(ds.Payload)
+	if err != nil {
+		logExecution("edge-agent.execution", "workload_failure", "error", map[string]any{
+			"node_id":      state.NodeID,
+			"version":      ds.Version,
+			"reason":       err.Error(),
+			"retryable":    true,
+			"retry_in_sec": currentLoopRetrySec(),
+		}, fmt.Sprintf("[RECONCILE] apply failed version=%d reason=%s", ds.Version, err.Error()))
+		return err
+	}
+
+	workloads, err := loadWorkloadState()
+	if err != nil {
+		logExecution("edge-agent.execution", "workload_failure", "error", map[string]any{
+			"node_id":      state.NodeID,
+			"workload_id":  command.WorkloadID,
+			"action":       command.Action,
+			"version":      ds.Version,
+			"reason":       err.Error(),
+			"retryable":    true,
+			"retry_in_sec": currentLoopRetrySec(),
+		}, fmt.Sprintf("[RECONCILE] apply failed version=%d reason=%s", ds.Version, err.Error()))
+		return err
+	}
+
+	switch command.Action {
+	case "start", "run", "apply":
+		logExecution("edge-agent.execution", "workload_start", "started", map[string]any{
+			"node_id":     state.NodeID,
+			"workload_id": command.WorkloadID,
+			"version":     ds.Version,
+		}, fmt.Sprintf("[RECONCILE] applying version=%d payload=%s", ds.Version, ds.Payload))
+
+		if command.Fail {
+			err := errors.New("forced failure")
+			logExecution("edge-agent.execution", "workload_failure", "error", map[string]any{
+				"node_id":      state.NodeID,
+				"workload_id":  command.WorkloadID,
+				"action":       "start",
+				"version":      ds.Version,
+				"reason":       err.Error(),
+				"retryable":    true,
+				"retry_in_sec": currentLoopRetrySec(),
+			}, fmt.Sprintf("[RECONCILE] apply failed version=%d reason=%s", ds.Version, err.Error()))
+			return err
+		}
+
+		workloads = addWorkload(workloads, command.WorkloadID)
+		if err := saveWorkloadState(workloads); err != nil {
+			logExecution("edge-agent.execution", "workload_failure", "error", map[string]any{
+				"node_id":      state.NodeID,
+				"workload_id":  command.WorkloadID,
+				"action":       "start",
+				"version":      ds.Version,
+				"reason":       err.Error(),
+				"retryable":    true,
+				"retry_in_sec": currentLoopRetrySec(),
+			}, fmt.Sprintf("[RECONCILE] apply failed version=%d reason=%s", ds.Version, err.Error()))
+			return err
+		}
+
+		logExecution("edge-agent.execution", "workload_start", "success", map[string]any{
+			"node_id":     state.NodeID,
+			"workload_id": command.WorkloadID,
+			"version":     ds.Version,
+		}, fmt.Sprintf("[RECONCILE] success version=%d", ds.Version))
+	case "stop", "remove", "delete":
+		logExecution("edge-agent.execution", "workload_stop", "started", map[string]any{
+			"node_id":     state.NodeID,
+			"workload_id": command.WorkloadID,
+			"version":     ds.Version,
+		}, fmt.Sprintf("[RECONCILE] applying version=%d payload=%s", ds.Version, ds.Payload))
+
+		if !hasWorkload(workloads, command.WorkloadID) {
+			err := errors.New("workload_not_found")
+			logExecution("edge-agent.execution", "workload_failure", "error", map[string]any{
+				"node_id":      state.NodeID,
+				"workload_id":  command.WorkloadID,
+				"action":       command.Action,
+				"version":      ds.Version,
+				"reason":       err.Error(),
+				"retryable":    true,
+				"retry_in_sec": currentLoopRetrySec(),
+			}, fmt.Sprintf("[RECONCILE] apply failed version=%d reason=%s", ds.Version, err.Error()))
+			return err
+		}
+		if command.Fail {
+			err := errors.New("forced failure")
+			logExecution("edge-agent.execution", "workload_failure", "error", map[string]any{
+				"node_id":      state.NodeID,
+				"workload_id":  command.WorkloadID,
+				"action":       command.Action,
+				"version":      ds.Version,
+				"reason":       err.Error(),
+				"retryable":    true,
+				"retry_in_sec": currentLoopRetrySec(),
+			}, fmt.Sprintf("[RECONCILE] apply failed version=%d reason=%s", ds.Version, err.Error()))
+			return err
+		}
+
+		workloads = removeWorkload(workloads, command.WorkloadID)
+		if err := saveWorkloadState(workloads); err != nil {
+			logExecution("edge-agent.execution", "workload_failure", "error", map[string]any{
+				"node_id":      state.NodeID,
+				"workload_id":  command.WorkloadID,
+				"action":       command.Action,
+				"version":      ds.Version,
+				"reason":       err.Error(),
+				"retryable":    true,
+				"retry_in_sec": currentLoopRetrySec(),
+			}, fmt.Sprintf("[RECONCILE] apply failed version=%d reason=%s", ds.Version, err.Error()))
+			return err
+		}
+
+		logExecution("edge-agent.execution", "workload_stop", "success", map[string]any{
+			"node_id":     state.NodeID,
+			"workload_id": command.WorkloadID,
+			"version":     ds.Version,
+		}, fmt.Sprintf("[RECONCILE] success version=%d", ds.Version))
+	default:
+		err := fmt.Errorf("unknown action %q", command.Action)
+		logExecution("edge-agent.execution", "workload_failure", "error", map[string]any{
+			"node_id":      state.NodeID,
+			"workload_id":  command.WorkloadID,
+			"action":       command.Action,
+			"version":      ds.Version,
+			"reason":       err.Error(),
+			"retryable":    true,
+			"retry_in_sec": currentLoopRetrySec(),
+		}, fmt.Sprintf("[RECONCILE] apply failed version=%d reason=%s", ds.Version, err.Error()))
+		return err
+	}
+
+	state.LastAppliedVersion = ds.Version
+	savePersistentState(*state)
+	return nil
 }
 
 func reconcile(state *PersistentState) {
 	ds, err := fetchDesiredState(*state)
 	if err != nil {
-		log.Println("fetch error:", err)
+		logSystem("edge-agent.reconcile", "desired_state_fetch_failed", "error", map[string]any{
+			"node_id":      state.NodeID,
+			"reason":       err.Error(),
+			"retryable":    true,
+			"retry_in_sec": currentLoopRetrySec(),
+		}, fmt.Sprintf("fetch error: %v", err))
 		return
 	}
 
@@ -272,32 +582,44 @@ func reconcile(state *PersistentState) {
 		return
 	}
 	if !verifyDesiredStateSignature(*state, *ds) {
-		log.Printf("[SECURITY][REJECT] desired-state invalid signature version=%d", ds.Version)
-		log.Printf("[RECONCILE] invalid signature version=%d", ds.Version)
+		logSystem("edge-agent.security", "desired_state_signature_rejected", "rejected", map[string]any{
+			"node_id":      state.NodeID,
+			"version":      ds.Version,
+			"reason":       "invalid signature",
+			"retryable":    true,
+			"retry_in_sec": currentLoopRetrySec(),
+		}, fmt.Sprintf("[SECURITY][REJECT] desired-state invalid signature version=%d", ds.Version))
+		logReconciliation("edge-agent.reconcile", "reconciliation_decision", "invalid-signature", map[string]any{
+			"node_id": state.NodeID,
+			"version": ds.Version,
+		}, fmt.Sprintf("[RECONCILE] invalid signature version=%d", ds.Version))
 		return
 	}
 
 	if ds.Version < state.LastAppliedVersion {
-		log.Printf("[RECONCILE] compare remote=%d local=%d result=stale",
-			ds.Version, state.LastAppliedVersion)
+		logReconciliation("edge-agent.reconcile", "reconciliation_decision", "stale", map[string]any{
+			"node_id": state.NodeID,
+			"remote":  ds.Version,
+			"local":   state.LastAppliedVersion,
+		}, fmt.Sprintf("[RECONCILE] compare remote=%d local=%d result=stale", ds.Version, state.LastAppliedVersion))
 		return
 	}
 	if ds.Version == state.LastAppliedVersion {
-		log.Printf("[RECONCILE] compare remote=%d local=%d result=in-sync",
-			ds.Version, state.LastAppliedVersion)
+		logReconciliation("edge-agent.reconcile", "reconciliation_decision", "in-sync", map[string]any{
+			"node_id": state.NodeID,
+			"remote":  ds.Version,
+			"local":   state.LastAppliedVersion,
+		}, fmt.Sprintf("[RECONCILE] compare remote=%d local=%d result=in-sync", ds.Version, state.LastAppliedVersion))
 		return
 	}
 
-	log.Printf("[RECONCILE] compare remote=%d local=%d result=drift",
-		ds.Version, state.LastAppliedVersion)
-	log.Printf("[RECONCILE] applying version=%d payload=%s",
-		ds.Version, ds.Payload)
+	logReconciliation("edge-agent.reconcile", "reconciliation_decision", "drift", map[string]any{
+		"node_id": state.NodeID,
+		"remote":  ds.Version,
+		"local":   state.LastAppliedVersion,
+	}, fmt.Sprintf("[RECONCILE] compare remote=%d local=%d result=drift", ds.Version, state.LastAppliedVersion))
 
-	// TODO: actual execution later
-
-	state.LastAppliedVersion = ds.Version
-	savePersistentState(*state)
-	log.Printf("[RECONCILE] success version=%d", ds.Version)
+	_ = applyDesiredState(state, *ds)
 }
 
 func initializeLocalState(nodeDir string) PersistentState {
@@ -309,14 +631,11 @@ func initializeLocalState(nodeDir string) PersistentState {
 		return registerNode()
 	}
 	if state.NodeSecret == "" {
-		log.Printf("[STATE] missing node secret for node=%s; registering again", state.NodeID)
+		logSystem("edge-agent.state", "node_identity_restore_failed", "missing-secret", map[string]any{
+			"node_id": state.NodeID,
+		}, fmt.Sprintf("[STATE] missing node secret for node=%s; registering again", state.NodeID))
 		return registerNode()
 	}
-
-	log.Printf("[STATE] restored node=%s last_applied=%d",
-		state.NodeID,
-		state.LastAppliedVersion,
-	)
 	return state
 }
 
@@ -329,10 +648,31 @@ func main() {
 	// connectWiFi() // platform-specific: implemented on Pico (TinyGo)
 	nodeDir := getenv("EDGE_NODE_DIR", ".")
 	state := initializeLocalState(nodeDir)
+	logSystem("edge-agent", "startup", "success", map[string]any{
+		"node_id":       state.NodeID,
+		"control_plane": controlPlaneBase,
+		"node_dir":      nodeDir,
+	}, "")
+
+	shutdownSignals := make(chan os.Signal, 1)
+	signal.Notify(shutdownSignals, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(shutdownSignals)
+
+	runOnce(&state)
+	heartbeatEvery := time.Duration(getenvInt("EDGE_HEARTBEAT_SEC", 10)) * time.Second
+	ticker := time.NewTicker(heartbeatEvery)
+	defer ticker.Stop()
 
 	for {
-		heartbeatEvery := time.Duration(getenvInt("EDGE_HEARTBEAT_SEC", 10)) * time.Second
-		runOnce(&state)
-		time.Sleep(heartbeatEvery)
+		select {
+		case sig := <-shutdownSignals:
+			logSystem("edge-agent", "shutdown", "success", map[string]any{
+				"node_id": state.NodeID,
+				"signal":  sig.String(),
+			}, "")
+			return
+		case <-ticker.C:
+			runOnce(&state)
+		}
 	}
 }
