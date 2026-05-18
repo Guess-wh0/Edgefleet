@@ -72,7 +72,7 @@ Anything else is a bug.
 
 ## Project Status
 
-**Phase 4 - Security & Guardrails**
+**Phase 4.5 - Observability**
 
 Current state:
 - State storage in control plane
@@ -84,6 +84,10 @@ Current state:
 - Signed desired state delivered with HMAC
 - Edge verifies signatures before applying
 - Basic Auth on control-plane user/admin endpoints
+- Append-only JSON line logs for both binaries
+- Separate `system`, `reconciliation`, and `execution` log categories
+- Local log files at `edge-agent/logs/agent.log` and `control-plane/logs/control.log`
+- Log entries use `timestamp`, `event`, `component`, `process`, `status`, and `context`
 
 Security test coverage is documented in `TESTING.md`.
 

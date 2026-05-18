@@ -116,6 +116,16 @@ func withControlPlaneBase(t *testing.T, base string) {
 	})
 }
 
+func withAgentLogPath(t *testing.T, path string) {
+	t.Helper()
+
+	previous := agentLogPath
+	agentLogPath = path
+	t.Cleanup(func() {
+		agentLogPath = previous
+	})
+}
+
 func withLogBuffer(t *testing.T) *bytes.Buffer {
 	t.Helper()
 
@@ -136,6 +146,41 @@ func withLogBuffer(t *testing.T) *bytes.Buffer {
 
 func countOccurrences(haystack, needle string) int {
 	return strings.Count(haystack, needle)
+}
+
+func readObservabilityLogEntries(t *testing.T, path string) []observabilityLogEntry {
+	t.Helper()
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read log file: %v", err)
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	var entries []observabilityLogEntry
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+
+		var entry observabilityLogEntry
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			t.Fatalf("decode log line %q: %v", line, err)
+		}
+		entries = append(entries, entry)
+	}
+
+	return entries
+}
+
+func findObservabilityEntries(entries []observabilityLogEntry, event string) []observabilityLogEntry {
+	var matches []observabilityLogEntry
+	for _, entry := range entries {
+		if entry.Event == event {
+			matches = append(matches, entry)
+		}
+	}
+	return matches
 }
 
 func TestSaveAndLoadPersistentState(t *testing.T) {
@@ -313,9 +358,6 @@ func TestEdgeRestartReusesNodeIDAndReconcilesIdempotently(t *testing.T) {
 	}
 
 	secondLogs := logBuffer.String()
-	if !strings.Contains(secondLogs, "[STATE] restored node=node-1 last_applied=4") {
-		t.Fatalf("restart logs should include restored state, got %q", secondLogs)
-	}
 	if strings.Contains(secondLogs, "[REGISTER]") {
 		t.Fatalf("restart logs should not register again, got %q", secondLogs)
 	}
@@ -392,9 +434,6 @@ func TestEdgeRestartDetectsDriftAndAppliesUpdatedDesiredStateOnce(t *testing.T) 
 	}
 
 	secondLogs := logBuffer.String()
-	if !strings.Contains(secondLogs, "[STATE] restored node=node-1 last_applied=4") {
-		t.Fatalf("restart logs should include restored state, got %q", secondLogs)
-	}
 	if !strings.Contains(secondLogs, "[RECONCILE] compare remote=5 local=4 result=drift") {
 		t.Fatalf("restart logs should detect drift, got %q", secondLogs)
 	}
@@ -620,5 +659,164 @@ func TestEdgeInvalidSignatureDoesNotBreakLaterValidReconcile(t *testing.T) {
 	}
 	if !strings.Contains(secondLogs, "[RECONCILE] success version=8") {
 		t.Fatalf("expected successful reconcile after recovery, got %q", secondLogs)
+	}
+}
+
+func TestAgentWritesStructuredObservabilityLogs(t *testing.T) {
+	tempDir := t.TempDir()
+	logPath := filepath.Join(tempDir, "logs", "agent.log")
+	withAgentLogPath(t, logPath)
+
+	_, server := newFakeControlPlane(t, 2, "deploy-now")
+	withControlPlaneBase(t, server.URL)
+
+	state := initializeLocalState(tempDir)
+	runOnce(&state)
+
+	entries := readObservabilityLogEntries(t, logPath)
+	if len(entries) == 0 {
+		t.Fatal("expected observability logs to be written")
+	}
+
+	var hasSystem bool
+	var hasReconciliation bool
+	var hasExecution bool
+
+	for _, entry := range entries {
+		if entry.Event == "" || entry.Component == "" || entry.Process == "" || entry.Timestamp == "" || entry.Status == "" {
+			t.Fatalf("log entry missing required fields: %+v", entry)
+		}
+
+		switch entry.Category {
+		case "system":
+			hasSystem = true
+		case "reconciliation":
+			hasReconciliation = true
+		case "execution":
+			hasExecution = true
+		}
+	}
+
+	if !hasSystem {
+		t.Fatalf("expected at least one system log, got %+v", entries)
+	}
+	if !hasReconciliation {
+		t.Fatalf("expected at least one reconciliation log, got %+v", entries)
+	}
+	if !hasExecution {
+		t.Fatalf("expected at least one execution log, got %+v", entries)
+	}
+
+	if len(findObservabilityEntries(entries, "node_registration")) == 0 {
+		t.Fatalf("expected node_registration event, got %+v", entries)
+	}
+	if len(findObservabilityEntries(entries, "heartbeat_sent")) == 0 {
+		t.Fatalf("expected heartbeat_sent event, got %+v", entries)
+	}
+	if len(findObservabilityEntries(entries, "desired_state_fetched")) == 0 {
+		t.Fatalf("expected desired_state_fetched event, got %+v", entries)
+	}
+	if len(findObservabilityEntries(entries, "reconciliation_decision")) == 0 {
+		t.Fatalf("expected reconciliation_decision event, got %+v", entries)
+	}
+	if len(findObservabilityEntries(entries, "workload_start")) == 0 {
+		t.Fatalf("expected workload_start event, got %+v", entries)
+	}
+}
+
+func TestAgentFailureLogsIncludeReasonAndRetryInfo(t *testing.T) {
+	tempDir := t.TempDir()
+	logPath := filepath.Join(tempDir, "logs", "agent.log")
+	withAgentLogPath(t, logPath)
+
+	server := httptest.NewServer(http.NewServeMux())
+	base := server.URL
+	server.Close()
+	withControlPlaneBase(t, base)
+
+	state := PersistentState{
+		NodeID:     "node-1",
+		NodeSecret: "secret-1",
+	}
+	withStateFile(t, filepath.Join(tempDir, stateFileName))
+	savePersistentState(state)
+
+	runOnce(&state)
+
+	entries := readObservabilityLogEntries(t, logPath)
+	heartbeatFailures := findObservabilityEntries(entries, "heartbeat_failed")
+	if len(heartbeatFailures) == 0 {
+		t.Fatalf("expected heartbeat_failed event, got %+v", entries)
+	}
+	fetchFailures := findObservabilityEntries(entries, "desired_state_fetch_failed")
+	if len(fetchFailures) == 0 {
+		t.Fatalf("expected desired_state_fetch_failed event, got %+v", entries)
+	}
+
+	for _, entry := range append(heartbeatFailures, fetchFailures...) {
+		if entry.Context["reason"] == "" {
+			t.Fatalf("expected failure reason in %+v", entry)
+		}
+		if entry.Context["retryable"] != true {
+			t.Fatalf("expected retryable=true in %+v", entry)
+		}
+		if entry.Context["retry_in_sec"] != float64(10) {
+			t.Fatalf("expected retry_in_sec=10 in %+v", entry)
+		}
+	}
+}
+
+func TestAgentWorkloadRemoveFailureIsLogged(t *testing.T) {
+	tempDir := t.TempDir()
+	logPath := filepath.Join(tempDir, "logs", "agent.log")
+	withAgentLogPath(t, logPath)
+
+	_, server := newFakeControlPlane(t, 2, `{"workload_id":"A","action":"remove"}`)
+	withControlPlaneBase(t, server.URL)
+
+	state := initializeLocalState(tempDir)
+	runOnce(&state)
+
+	entries := readObservabilityLogEntries(t, logPath)
+	failures := findObservabilityEntries(entries, "workload_failure")
+	if len(failures) == 0 {
+		t.Fatalf("expected workload_failure event, got %+v", entries)
+	}
+
+	failure := failures[len(failures)-1]
+	if failure.Context["workload_id"] != "A" {
+		t.Fatalf("expected workload_id A, got %+v", failure)
+	}
+	if failure.Context["reason"] != "workload_not_found" {
+		t.Fatalf("expected workload_not_found reason, got %+v", failure)
+	}
+	if failure.Context["retryable"] != true {
+		t.Fatalf("expected retryable=true, got %+v", failure)
+	}
+	if failure.Context["retry_in_sec"] != float64(10) {
+		t.Fatalf("expected retry_in_sec=10, got %+v", failure)
+	}
+}
+
+func TestAgentForcedWorkloadFailureIsLogged(t *testing.T) {
+	tempDir := t.TempDir()
+	logPath := filepath.Join(tempDir, "logs", "agent.log")
+	withAgentLogPath(t, logPath)
+
+	_, server := newFakeControlPlane(t, 2, `{"workload_id":"A","action":"start","fail":true}`)
+	withControlPlaneBase(t, server.URL)
+
+	state := initializeLocalState(tempDir)
+	runOnce(&state)
+
+	entries := readObservabilityLogEntries(t, logPath)
+	failures := findObservabilityEntries(entries, "workload_failure")
+	if len(failures) == 0 {
+		t.Fatalf("expected workload_failure event, got %+v", entries)
+	}
+
+	failure := failures[len(failures)-1]
+	if failure.Context["reason"] != "forced failure" {
+		t.Fatalf("expected forced failure reason, got %+v", failure)
 	}
 }

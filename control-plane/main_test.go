@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 const (
@@ -53,6 +54,16 @@ func withControlPlaneBasicAuth(t *testing.T, username, password string) {
 	t.Cleanup(func() {
 		controlPlaneUser = previousUser
 		controlPlanePassword = previousPassword
+	})
+}
+
+func withControlLogPath(t *testing.T, path string) {
+	t.Helper()
+
+	previous := controlLogPath
+	controlLogPath = path
+	t.Cleanup(func() {
+		controlLogPath = previous
 	})
 }
 
@@ -107,6 +118,63 @@ func withLogBuffer(t *testing.T) *bytes.Buffer {
 	})
 
 	return &buffer
+}
+
+func readObservabilityLogEntries(t *testing.T, path string) []observabilityLogEntry {
+	t.Helper()
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read log file: %v", err)
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	var entries []observabilityLogEntry
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+
+		var entry observabilityLogEntry
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			t.Fatalf("decode log line %q: %v", line, err)
+		}
+		entries = append(entries, entry)
+	}
+
+	return entries
+}
+
+func findObservabilityEntries(entries []observabilityLogEntry, event string) []observabilityLogEntry {
+	var matches []observabilityLogEntry
+	for _, entry := range entries {
+		if entry.Event == event {
+			matches = append(matches, entry)
+		}
+	}
+	return matches
+}
+
+func TestControlPlaneDefaultLogPathWorksFromRepoRoot(t *testing.T) {
+	previous, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+
+	repoRoot := filepath.Dir(previous)
+	if err := os.Chdir(repoRoot); err != nil {
+		t.Fatalf("chdir repo root: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(previous); err != nil {
+			t.Fatalf("restore workdir: %v", err)
+		}
+	})
+
+	expected := filepath.Join("control-plane", "logs", "control.log")
+	if actual := defaultServiceLogPath("control-plane", "control.log"); actual != expected {
+		t.Fatalf("default log path = %q, want %q", actual, expected)
+	}
 }
 
 func TestControlPlaneRestartPreservesDesiredStateAndHeartbeat(t *testing.T) {
@@ -762,5 +830,157 @@ func TestNodesAcceptValidBasicAuth(t *testing.T) {
 	}
 	if !strings.Contains(resp.Body.String(), "node-visible | active |") {
 		t.Fatalf("nodes body = %q, want node listing", resp.Body.String())
+	}
+}
+
+func TestControlPlaneWritesStructuredObservabilityLogs(t *testing.T) {
+	withTempWorkingDir(t)
+	withControlPlaneBasicAuth(t, testControlPlaneUser, testControlPlanePassword)
+
+	logPath := filepath.Join(t.TempDir(), "logs", "control.log")
+	withControlLogPath(t, logPath)
+
+	if err := initDB(); err != nil {
+		t.Fatalf("init db: %v", err)
+	}
+
+	mux := testMux()
+	registerResp := performRequest(t, mux, http.MethodPost, "/register", "", map[string]string{
+		"X-Node-Hostname": "obs-node",
+		"X-Node-Arch":     "amd64",
+	})
+	if registerResp.Code != http.StatusOK {
+		t.Fatalf("register status = %d, want %d", registerResp.Code, http.StatusOK)
+	}
+
+	var registration RegistrationResponse
+	if err := json.Unmarshal(registerResp.Body.Bytes(), &registration); err != nil {
+		t.Fatalf("decode register response: %v", err)
+	}
+
+	setDesiredResp := performRequest(
+		t,
+		mux,
+		http.MethodPost,
+		"/debug/set-desired?nodeID="+registration.NodeID+"&version=4",
+		`{"version":4,"payload":"observe"}`,
+		authorizedHeaders(nil),
+	)
+	if setDesiredResp.Code != http.StatusOK {
+		t.Fatalf("set desired status = %d, want %d", setDesiredResp.Code, http.StatusOK)
+	}
+
+	heartbeatResp := performRequest(t, mux, http.MethodPost, "/heartbeat", "", map[string]string{
+		"X-Node-ID":    registration.NodeID,
+		"X-Node-Token": registration.NodeSecret,
+	})
+	if heartbeatResp.Code != http.StatusOK {
+		t.Fatalf("heartbeat status = %d, want %d", heartbeatResp.Code, http.StatusOK)
+	}
+
+	fetchResp := performRequest(t, mux, http.MethodGet, "/desired-state/"+registration.NodeID, "", map[string]string{
+		"X-Node-ID":    registration.NodeID,
+		"X-Node-Token": registration.NodeSecret,
+	})
+	if fetchResp.Code != http.StatusOK {
+		t.Fatalf("desired state fetch status = %d, want %d", fetchResp.Code, http.StatusOK)
+	}
+
+	entries := readObservabilityLogEntries(t, logPath)
+	if len(entries) == 0 {
+		t.Fatal("expected observability logs to be written")
+	}
+
+	var hasSystem bool
+	var hasReconciliation bool
+
+	for _, entry := range entries {
+		if entry.Event == "" || entry.Component == "" || entry.Process == "" || entry.Timestamp == "" || entry.Status == "" {
+			t.Fatalf("log entry missing required fields: %+v", entry)
+		}
+
+		switch entry.Category {
+		case "system":
+			hasSystem = true
+		case "reconciliation":
+			hasReconciliation = true
+		}
+	}
+
+	if !hasSystem {
+		t.Fatalf("expected at least one system log, got %+v", entries)
+	}
+	if !hasReconciliation {
+		t.Fatalf("expected at least one reconciliation log, got %+v", entries)
+	}
+
+	if len(findObservabilityEntries(entries, "node_registered")) == 0 {
+		t.Fatalf("expected node_registered event, got %+v", entries)
+	}
+	if len(findObservabilityEntries(entries, "heartbeat_received")) == 0 {
+		t.Fatalf("expected heartbeat_received event, got %+v", entries)
+	}
+	if len(findObservabilityEntries(entries, "desired_state_served")) == 0 {
+		t.Fatalf("expected desired_state_served event, got %+v", entries)
+	}
+}
+
+func TestControlPlaneMarksNodeUnknownAndLogsIt(t *testing.T) {
+	withTempWorkingDir(t)
+	withControlPlaneBasicAuth(t, testControlPlaneUser, testControlPlanePassword)
+
+	logPath := filepath.Join(t.TempDir(), "logs", "control.log")
+	withControlLogPath(t, logPath)
+
+	if err := initDB(); err != nil {
+		t.Fatalf("init db: %v", err)
+	}
+
+	staleTime := time.Now().UTC().Add(-2 * heartbeatExpiry)
+	if _, err := db.Exec(
+		`INSERT INTO nodes (node_id, node_secret, last_heartbeat, status, hostname, arch)
+		VALUES (?, ?, ?, 'active', 'stale-node', 'amd64')`,
+		"stale-node",
+		"secret-stale",
+		staleTime,
+	); err != nil {
+		t.Fatalf("insert stale node: %v", err)
+	}
+
+	stop := make(chan struct{})
+	go livenessSweep(stop)
+	t.Cleanup(func() {
+		select {
+		case <-stop:
+		default:
+			close(stop)
+		}
+	})
+
+	time.Sleep(sweepInterval + (500 * time.Millisecond))
+
+	var status string
+	if err := db.QueryRow(`SELECT status FROM nodes WHERE node_id = ?`, "stale-node").Scan(&status); err != nil {
+		t.Fatalf("query node status: %v", err)
+	}
+	if status != "unknown" {
+		t.Fatalf("node status = %q, want %q", status, "unknown")
+	}
+
+	entries := readObservabilityLogEntries(t, logPath)
+	unknowns := findObservabilityEntries(entries, "node_marked_unknown")
+	if len(unknowns) == 0 {
+		t.Fatalf("expected node_marked_unknown event, got %+v", entries)
+	}
+
+	found := false
+	for _, entry := range unknowns {
+		if entry.Context["node_id"] == "stale-node" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected stale-node in node_marked_unknown logs, got %+v", unknowns)
 	}
 }

@@ -355,10 +355,7 @@ desired_state (
 ## Phase Status
 
 - Phase 3: complete
-- Phase 4 in progress:
-  - Edge identity and token auth: complete
-  - Basic Auth on admin endpoints: complete
-  - Signed desired state: complete
+- Phase 4: complete
 
 ---
 
