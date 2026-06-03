@@ -58,6 +58,14 @@ func saveObservedState(state ObservedState) error {
 // Reconciliation owns comparison, handler selection, execution, and observed-state updates.
 func reconcileTypedDesiredState(state *PersistentState, desired DesiredState, handlers map[string]Handler) error {
 	if err := validateTypedDesiredState(desired); err != nil {
+		logReconciliation("edge-agent.reconcile", "reconciliation_decision", "invalid-desired", map[string]any{
+			"node_id":     state.NodeID,
+			"workload_id": desired.WorkloadID,
+			"type":        desired.Type,
+			"version":     desired.Version,
+			"reason":      err.Error(),
+			"retryable":   false,
+		}, fmt.Sprintf("[RECONCILE] invalid desired workload=%s reason=%s", desired.WorkloadID, err.Error()))
 		return err
 	}
 
@@ -97,8 +105,25 @@ func reconcileTypedDesiredState(state *PersistentState, desired DesiredState, ha
 
 	handler, ok := handlers[desired.Type]
 	if !ok {
+		logExecution("edge-agent.execution", "handler_selection_failed", "error", map[string]any{
+			"node_id":      state.NodeID,
+			"workload_id":  desired.WorkloadID,
+			"type":         desired.Type,
+			"version":      desired.Version,
+			"reason":       "unknown workload type",
+			"retryable":    false,
+			"retry_in_sec": currentLoopRetrySec(),
+		}, fmt.Sprintf("[HANDLER] unknown type=%s workload=%s", desired.Type, desired.WorkloadID))
 		return fmt.Errorf("unknown workload type %q", desired.Type)
 	}
+	handlerStatus := handler.Status()
+	logExecution("edge-agent.execution", "handler_selected", "success", map[string]any{
+		"node_id":        state.NodeID,
+		"workload_id":    desired.WorkloadID,
+		"type":           desired.Type,
+		"version":        desired.Version,
+		"handler_status": handlerStatus.Status,
+	}, fmt.Sprintf("[HANDLER] selected type=%s workload=%s status=%s", desired.Type, desired.WorkloadID, handlerStatus.Status))
 
 	logExecution("edge-agent.execution", "workload_execute_started", "started", map[string]any{
 		"node_id":     state.NodeID,
@@ -120,6 +145,13 @@ func reconcileTypedDesiredState(state *PersistentState, desired DesiredState, ha
 	if err := saveObservedState(observed); err != nil {
 		return err
 	}
+	logReconciliation("edge-agent.reconcile", "observed_state_updated", "success", map[string]any{
+		"node_id":     state.NodeID,
+		"workload_id": desired.WorkloadID,
+		"type":        desired.Type,
+		"version":     desired.Version,
+		"status":      result.Status,
+	}, fmt.Sprintf("[RECONCILE] observed workload=%s version=%d status=%s", desired.WorkloadID, desired.Version, result.Status))
 
 	status := "success"
 	event := "workload_execute_succeeded"
@@ -149,13 +181,6 @@ func reconcileTypedDesiredState(state *PersistentState, desired DesiredState, ha
 
 	state.LastAppliedVersion = desired.Version
 	savePersistentState(*state)
-	logReconciliation("edge-agent.reconcile", "observed_state_updated", "success", map[string]any{
-		"node_id":     state.NodeID,
-		"workload_id": desired.WorkloadID,
-		"type":        desired.Type,
-		"version":     desired.Version,
-		"status":      result.Status,
-	}, fmt.Sprintf("[RECONCILE] observed workload=%s version=%d status=%s", desired.WorkloadID, desired.Version, result.Status))
 	return nil
 }
 
@@ -219,6 +244,17 @@ func stopWorkloadsMissingFromDesired(state PersistentState, observed ObservedSta
 		if err := saveObservedState(observed); err != nil {
 			return err
 		}
+		observedStatus := "removed"
+		if !workloadIsStopped(result.Status) {
+			observedStatus = "stop_failed"
+		}
+		logReconciliation("edge-agent.reconcile", "observed_state_updated", "success", map[string]any{
+			"node_id":     state.NodeID,
+			"workload_id": workloadID,
+			"type":        workload.Type,
+			"version":     workload.Version,
+			"status":      observedStatus,
+		}, fmt.Sprintf("[RECONCILE] observed workload=%s status=%s", workloadID, observedStatus))
 
 		event := "workload_stop_succeeded"
 		status := "success"

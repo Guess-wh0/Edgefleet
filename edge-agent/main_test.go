@@ -875,8 +875,14 @@ func TestTypedScriptWorkloadExecutesAndPersistsObservedState(t *testing.T) {
 	}
 
 	entries := readObservabilityLogEntries(t, logPath)
+	if len(findObservabilityEntries(entries, "handler_selected")) == 0 {
+		t.Fatalf("expected handler_selected event, got %+v", entries)
+	}
 	if len(findObservabilityEntries(entries, "workload_execute_succeeded")) == 0 {
 		t.Fatalf("expected workload_execute_succeeded event, got %+v", entries)
+	}
+	if len(findObservabilityEntries(entries, "observed_state_updated")) == 0 {
+		t.Fatalf("expected observed_state_updated event, got %+v", entries)
 	}
 }
 
@@ -907,6 +913,8 @@ func TestTypedScriptWorkloadIsIdempotentByObservedVersion(t *testing.T) {
 
 func TestDesiredStateDeletionStopsObservedTypedWorkload(t *testing.T) {
 	tempDir := t.TempDir()
+	logPath := filepath.Join(tempDir, "logs", "agent.log")
+	withAgentLogPath(t, logPath)
 
 	cp, server := newFakeControlPlane(t, 0, "")
 	cp.mu.Lock()
@@ -942,5 +950,95 @@ func TestDesiredStateDeletionStopsObservedTypedWorkload(t *testing.T) {
 	}
 	if len(observed.Workloads) != 0 {
 		t.Fatalf("expected deletion cleanup to remove observed workloads, got %+v", observed)
+	}
+
+	entries := readObservabilityLogEntries(t, logPath)
+	if len(findObservabilityEntries(entries, "workload_stop_succeeded")) == 0 {
+		t.Fatalf("expected workload_stop_succeeded event, got %+v", entries)
+	}
+	updates := findObservabilityEntries(entries, "observed_state_updated")
+	if len(updates) == 0 {
+		t.Fatalf("expected observed_state_updated event, got %+v", entries)
+	}
+	lastUpdate := updates[len(updates)-1]
+	if lastUpdate.Context["status"] != "removed" {
+		t.Fatalf("expected observed state removal log, got %+v", lastUpdate)
+	}
+}
+
+func TestTypedUnknownWorkloadTypeLogsHandlerSelectionFailure(t *testing.T) {
+	tempDir := t.TempDir()
+	logPath := filepath.Join(tempDir, "logs", "agent.log")
+	withAgentLogPath(t, logPath)
+
+	cp, server := newFakeControlPlane(t, 3, "")
+	cp.mu.Lock()
+	cp.desiredTyped = &DesiredState{
+		WorkloadID: "mystery-1",
+		Type:       "mystery",
+		Spec:       json.RawMessage(`{"value":"ignored"}`),
+	}
+	cp.mu.Unlock()
+	withControlPlaneBase(t, server.URL)
+
+	state := initializeLocalState(tempDir)
+	runOnce(&state)
+
+	entries := readObservabilityLogEntries(t, logPath)
+	failures := findObservabilityEntries(entries, "handler_selection_failed")
+	if len(failures) == 0 {
+		t.Fatalf("expected handler_selection_failed event, got %+v", entries)
+	}
+	failure := failures[len(failures)-1]
+	if failure.Context["type"] != "mystery" {
+		t.Fatalf("expected unknown type in handler selection failure, got %+v", failure)
+	}
+	if failure.Context["retryable"] != false {
+		t.Fatalf("expected retryable=false for unknown handler type, got %+v", failure)
+	}
+}
+
+func TestTypedScriptFailureLogsObservedStateAndRetries(t *testing.T) {
+	tempDir := t.TempDir()
+	logPath := filepath.Join(tempDir, "logs", "agent.log")
+	withAgentLogPath(t, logPath)
+
+	cp, server := newFakeControlPlane(t, 4, "")
+	cp.mu.Lock()
+	cp.desiredTyped = &DesiredState{
+		WorkloadID: "script-fail",
+		Type:       "script",
+		Spec:       json.RawMessage(`{"command":"exit 7"}`),
+	}
+	cp.mu.Unlock()
+	withControlPlaneBase(t, server.URL)
+
+	state := initializeLocalState(tempDir)
+	runOnce(&state)
+	runOnce(&state)
+
+	if state.LastAppliedVersion != 0 {
+		t.Fatalf("last applied version = %d, want 0 after failed script", state.LastAppliedVersion)
+	}
+	observed, err := loadObservedState()
+	if err != nil {
+		t.Fatalf("load observed state: %v", err)
+	}
+	workload := observed.Workloads["script-fail"]
+	if workload.Status != "failed" {
+		t.Fatalf("observed failed workload status = %q, want failed", workload.Status)
+	}
+
+	entries := readObservabilityLogEntries(t, logPath)
+	if got := len(findObservabilityEntries(entries, "workload_execute_started")); got != 2 {
+		t.Fatalf("failed script should be retried, execute_started count = %d, want 2", got)
+	}
+	failures := findObservabilityEntries(entries, "workload_execute_failed")
+	if len(failures) != 2 {
+		t.Fatalf("expected two workload_execute_failed events, got %+v", failures)
+	}
+	lastFailure := failures[len(failures)-1]
+	if lastFailure.Context["retryable"] != true {
+		t.Fatalf("expected retryable=true for failed script, got %+v", lastFailure)
 	}
 }
