@@ -554,6 +554,72 @@ func TestDesiredStateResponseIsSigned(t *testing.T) {
 	}
 }
 
+func TestTypedDesiredStateResponseIsSigned(t *testing.T) {
+	withTempWorkingDir(t)
+	withControlPlaneBasicAuth(t, testControlPlaneUser, testControlPlanePassword)
+
+	if err := initDB(); err != nil {
+		t.Fatalf("init db: %v", err)
+	}
+
+	mux := testMux()
+	registerResp := performRequest(t, mux, http.MethodPost, "/register", "", map[string]string{
+		"X-Node-Hostname": "typed-node",
+		"X-Node-Arch":     "amd64",
+	})
+	if registerResp.Code != http.StatusOK {
+		t.Fatalf("register status = %d, want %d", registerResp.Code, http.StatusOK)
+	}
+
+	var registration RegistrationResponse
+	if err := json.Unmarshal(registerResp.Body.Bytes(), &registration); err != nil {
+		t.Fatalf("decode register response: %v", err)
+	}
+
+	const desiredPayload = `{"workload_id":"script-1","type":"script","spec":{"command":"echo hello"}}`
+	setDesiredResp := performRequest(
+		t,
+		mux,
+		http.MethodPost,
+		"/debug/set-desired?nodeID="+registration.NodeID+"&version=13",
+		desiredPayload,
+		authorizedHeaders(nil),
+	)
+	if setDesiredResp.Code != http.StatusOK {
+		t.Fatalf("set desired status = %d, want %d", setDesiredResp.Code, http.StatusOK)
+	}
+
+	resp := performRequest(t, mux, http.MethodGet, "/desired-state/"+registration.NodeID, "", map[string]string{
+		"X-Node-ID":    registration.NodeID,
+		"X-Node-Token": registration.NodeSecret,
+	})
+	if resp.Code != http.StatusOK {
+		t.Fatalf("desired state status = %d, want %d", resp.Code, http.StatusOK)
+	}
+
+	var envelope DesiredStateEnvelope
+	if err := json.Unmarshal(resp.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("decode desired state response: %v", err)
+	}
+	if envelope.Version != 13 {
+		t.Fatalf("typed desired version = %d, want %d", envelope.Version, 13)
+	}
+	if envelope.WorkloadID != "script-1" {
+		t.Fatalf("typed desired workload_id = %q, want script-1", envelope.WorkloadID)
+	}
+	if envelope.Type != "script" {
+		t.Fatalf("typed desired type = %q, want script", envelope.Type)
+	}
+	if string(envelope.Spec) != `{"command":"echo hello"}` {
+		t.Fatalf("typed desired spec = %s", string(envelope.Spec))
+	}
+
+	expectedSignature := signDesiredState(registration.NodeID, 13, envelope.signingPayload(), registration.NodeSecret)
+	if envelope.Signature != expectedSignature {
+		t.Fatalf("typed desired signature did not match expected value")
+	}
+}
+
 func TestEdgeCannotFetchAnotherNodesDesiredState(t *testing.T) {
 	withTempWorkingDir(t)
 	withControlPlaneBasicAuth(t, testControlPlaneUser, testControlPlanePassword)

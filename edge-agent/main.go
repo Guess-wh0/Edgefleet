@@ -28,9 +28,12 @@ const workloadsFileName = "workloads.json"
 var stateFile = ""
 
 type DesiredState struct {
-	Version   int    `json:"version"`
-	Payload   string `json:"payload"`
-	Signature string `json:"signature"`
+	Version    int             `json:"version"`
+	WorkloadID string          `json:"workload_id,omitempty"`
+	Type       string          `json:"type,omitempty"`
+	Spec       json.RawMessage `json:"spec,omitempty"`
+	Payload    string          `json:"payload,omitempty"`
+	Signature  string          `json:"signature"`
 }
 
 type RegistrationResponse struct {
@@ -55,6 +58,35 @@ type workloadState struct {
 	Active []string `json:"active"`
 }
 
+type desiredStateSignatureBody struct {
+	Version    int             `json:"version"`
+	WorkloadID string          `json:"workload_id"`
+	Type       string          `json:"type"`
+	Spec       json.RawMessage `json:"spec"`
+}
+
+func (ds DesiredState) hasTypedWorkload() bool {
+	return ds.WorkloadID != "" || ds.Type != "" || len(ds.Spec) > 0
+}
+
+func (ds DesiredState) signingPayload() string {
+	if !ds.hasTypedWorkload() {
+		return ds.Payload
+	}
+
+	body := desiredStateSignatureBody{
+		Version:    ds.Version,
+		WorkloadID: ds.WorkloadID,
+		Type:       ds.Type,
+		Spec:       ds.Spec,
+	}
+	data, err := json.Marshal(body)
+	if err != nil {
+		return ""
+	}
+	return string(data)
+}
+
 func isSecurityFailureStatus(statusCode int) bool {
 	return statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden
 }
@@ -66,7 +98,7 @@ func signDesiredState(nodeID string, version int, payload, nodeSecret string) st
 }
 
 func verifyDesiredStateSignature(state PersistentState, ds DesiredState) bool {
-	expected := signDesiredState(state.NodeID, ds.Version, ds.Payload, state.NodeSecret)
+	expected := signDesiredState(state.NodeID, ds.Version, ds.signingPayload(), state.NodeSecret)
 	return hmac.Equal([]byte(expected), []byte(ds.Signature))
 }
 
@@ -420,13 +452,19 @@ func fetchDesiredState(state PersistentState) (*DesiredState, error) {
 		return nil, err
 	}
 	logReconciliation("edge-agent.reconcile", "desired_state_fetched", "success", map[string]any{
-		"node_id": state.NodeID,
-		"version": ds.Version,
+		"node_id":     state.NodeID,
+		"version":     ds.Version,
+		"workload_id": ds.WorkloadID,
+		"type":        ds.Type,
 	}, fmt.Sprintf("[fetched_state] version=%d", ds.Version))
 	return &ds, nil
 }
 
 func applyDesiredState(state *PersistentState, ds DesiredState) error {
+	if ds.hasTypedWorkload() {
+		return reconcileTypedDesiredState(state, ds, defaultHandlers())
+	}
+
 	command, err := parseWorkloadCommand(ds.Payload)
 	if err != nil {
 		logExecution("edge-agent.execution", "workload_failure", "error", map[string]any{
@@ -579,6 +617,7 @@ func reconcile(state *PersistentState) {
 	}
 
 	if ds == nil {
+		stopObservedWorkloads(*state, defaultHandlers())
 		return
 	}
 	if !verifyDesiredStateSignature(*state, *ds) {
@@ -593,6 +632,21 @@ func reconcile(state *PersistentState) {
 			"node_id": state.NodeID,
 			"version": ds.Version,
 		}, fmt.Sprintf("[RECONCILE] invalid signature version=%d", ds.Version))
+		return
+	}
+
+	if ds.hasTypedWorkload() {
+		if err := reconcileTypedDesiredState(state, *ds, defaultHandlers()); err != nil {
+			logReconciliation("edge-agent.reconcile", "reconciliation_decision", "retry-needed", map[string]any{
+				"node_id":      state.NodeID,
+				"version":      ds.Version,
+				"workload_id":  ds.WorkloadID,
+				"type":         ds.Type,
+				"reason":       err.Error(),
+				"retryable":    true,
+				"retry_in_sec": currentLoopRetrySec(),
+			}, fmt.Sprintf("[RECONCILE] typed apply failed version=%d workload=%s reason=%s", ds.Version, ds.WorkloadID, err.Error()))
+		}
 		return
 	}
 

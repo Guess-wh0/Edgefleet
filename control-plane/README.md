@@ -354,9 +354,7 @@ desired_state (
 
 ## Phase Status
 
-- Phase 3: complete
-- Phase 4: complete
-
+- Phase 5: in progress
 ---
 
 ## Philosophy
