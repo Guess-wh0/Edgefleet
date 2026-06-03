@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 type fakeControlPlane struct {
@@ -23,6 +24,8 @@ type fakeControlPlane struct {
 	heartbeatNodes []string
 	desiredVersion int
 	desiredPayload string
+	desiredTyped   *DesiredState
+	noDesired      bool
 }
 
 func newFakeControlPlane(t *testing.T, desiredVersion int, desiredPayload string) (*fakeControlPlane, *httptest.Server) {
@@ -74,17 +77,24 @@ func newFakeControlPlane(t *testing.T, desiredVersion int, desiredPayload string
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
-
-		signingPayload := cp.desiredPayload
-		if cp.signingPayload != "" {
-			signingPayload = cp.signingPayload
+		if cp.noDesired {
+			w.WriteHeader(http.StatusOK)
+			return
 		}
 
 		envelope := DesiredState{
-			Version:   cp.desiredVersion,
-			Payload:   cp.desiredPayload,
-			Signature: signDesiredState(cp.nodeID, cp.desiredVersion, signingPayload, cp.signingSecret),
+			Version: cp.desiredVersion,
+			Payload: cp.desiredPayload,
 		}
+		if cp.desiredTyped != nil {
+			envelope = *cp.desiredTyped
+			envelope.Version = cp.desiredVersion
+		}
+		signingPayload := envelope.signingPayload()
+		if cp.signingPayload != "" {
+			signingPayload = cp.signingPayload
+		}
+		envelope.Signature = signDesiredState(cp.nodeID, envelope.Version, signingPayload, cp.signingSecret)
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
@@ -818,5 +828,217 @@ func TestAgentForcedWorkloadFailureIsLogged(t *testing.T) {
 	failure := failures[len(failures)-1]
 	if failure.Context["reason"] != "forced failure" {
 		t.Fatalf("expected forced failure reason, got %+v", failure)
+	}
+}
+
+func TestTypedScriptWorkloadExecutesAndPersistsObservedState(t *testing.T) {
+	tempDir := t.TempDir()
+	logPath := filepath.Join(tempDir, "logs", "agent.log")
+	withAgentLogPath(t, logPath)
+
+	cp, server := newFakeControlPlane(t, 1, "")
+	cp.mu.Lock()
+	cp.desiredTyped = &DesiredState{
+		WorkloadID: "script-1",
+		Type:       "script",
+		Spec:       json.RawMessage(`{"command":"echo hello"}`),
+	}
+	cp.mu.Unlock()
+	withControlPlaneBase(t, server.URL)
+
+	state := initializeLocalState(tempDir)
+	runOnce(&state)
+
+	observed, err := loadObservedState()
+	if err != nil {
+		t.Fatalf("load observed state: %v", err)
+	}
+
+	workload, ok := observed.Workloads["script-1"]
+	if !ok {
+		t.Fatalf("expected script-1 in observed state, got %+v", observed)
+	}
+	if workload.Version != 1 {
+		t.Fatalf("observed version = %d, want %d", workload.Version, 1)
+	}
+	if workload.Type != "script" {
+		t.Fatalf("observed type = %q, want script", workload.Type)
+	}
+	if workload.Status != "succeeded" {
+		t.Fatalf("observed status = %q, want succeeded; error=%q", workload.Status, workload.LastError)
+	}
+	if !strings.Contains(workload.LastOutput, "hello") {
+		t.Fatalf("expected captured output to contain hello, got %q", workload.LastOutput)
+	}
+	if state.LastAppliedVersion != 1 {
+		t.Fatalf("last applied version = %d, want %d", state.LastAppliedVersion, 1)
+	}
+
+	entries := readObservabilityLogEntries(t, logPath)
+	if len(findObservabilityEntries(entries, "handler_selected")) == 0 {
+		t.Fatalf("expected handler_selected event, got %+v", entries)
+	}
+	if len(findObservabilityEntries(entries, "workload_execute_succeeded")) == 0 {
+		t.Fatalf("expected workload_execute_succeeded event, got %+v", entries)
+	}
+	if len(findObservabilityEntries(entries, "observed_state_updated")) == 0 {
+		t.Fatalf("expected observed_state_updated event, got %+v", entries)
+	}
+}
+
+func TestTypedScriptWorkloadIsIdempotentByObservedVersion(t *testing.T) {
+	tempDir := t.TempDir()
+	logPath := filepath.Join(tempDir, "logs", "agent.log")
+	withAgentLogPath(t, logPath)
+
+	cp, server := newFakeControlPlane(t, 2, "")
+	cp.mu.Lock()
+	cp.desiredTyped = &DesiredState{
+		WorkloadID: "script-idempotent",
+		Type:       "script",
+		Spec:       json.RawMessage(`{"command":"echo run"}`),
+	}
+	cp.mu.Unlock()
+	withControlPlaneBase(t, server.URL)
+
+	state := initializeLocalState(tempDir)
+	runOnce(&state)
+	runOnce(&state)
+
+	entries := readObservabilityLogEntries(t, logPath)
+	if got := len(findObservabilityEntries(entries, "workload_execute_started")); got != 1 {
+		t.Fatalf("script execution count = %d, want %d; entries=%+v", got, 1, entries)
+	}
+}
+
+func TestDesiredStateDeletionStopsObservedTypedWorkload(t *testing.T) {
+	tempDir := t.TempDir()
+	logPath := filepath.Join(tempDir, "logs", "agent.log")
+	withAgentLogPath(t, logPath)
+
+	cp, server := newFakeControlPlane(t, 0, "")
+	cp.mu.Lock()
+	cp.noDesired = true
+	cp.mu.Unlock()
+	withControlPlaneBase(t, server.URL)
+
+	withStateFile(t, filepath.Join(tempDir, stateFileName))
+	state := PersistentState{
+		NodeID:     "node-1",
+		NodeSecret: "secret-1",
+	}
+	savePersistentState(state)
+	if err := saveObservedState(ObservedState{
+		Workloads: map[string]ObservedWorkload{
+			"script-old": {
+				Version:   1,
+				Type:      "script",
+				Status:    "succeeded",
+				Spec:      json.RawMessage(`{"command":"echo old"}`),
+				UpdatedAt: time.Now().UTC().Format(time.RFC3339),
+			},
+		},
+	}); err != nil {
+		t.Fatalf("save observed state: %v", err)
+	}
+
+	runOnce(&state)
+
+	observed, err := loadObservedState()
+	if err != nil {
+		t.Fatalf("load observed state: %v", err)
+	}
+	if len(observed.Workloads) != 0 {
+		t.Fatalf("expected deletion cleanup to remove observed workloads, got %+v", observed)
+	}
+
+	entries := readObservabilityLogEntries(t, logPath)
+	if len(findObservabilityEntries(entries, "workload_stop_succeeded")) == 0 {
+		t.Fatalf("expected workload_stop_succeeded event, got %+v", entries)
+	}
+	updates := findObservabilityEntries(entries, "observed_state_updated")
+	if len(updates) == 0 {
+		t.Fatalf("expected observed_state_updated event, got %+v", entries)
+	}
+	lastUpdate := updates[len(updates)-1]
+	if lastUpdate.Context["status"] != "removed" {
+		t.Fatalf("expected observed state removal log, got %+v", lastUpdate)
+	}
+}
+
+func TestTypedUnknownWorkloadTypeLogsHandlerSelectionFailure(t *testing.T) {
+	tempDir := t.TempDir()
+	logPath := filepath.Join(tempDir, "logs", "agent.log")
+	withAgentLogPath(t, logPath)
+
+	cp, server := newFakeControlPlane(t, 3, "")
+	cp.mu.Lock()
+	cp.desiredTyped = &DesiredState{
+		WorkloadID: "mystery-1",
+		Type:       "mystery",
+		Spec:       json.RawMessage(`{"value":"ignored"}`),
+	}
+	cp.mu.Unlock()
+	withControlPlaneBase(t, server.URL)
+
+	state := initializeLocalState(tempDir)
+	runOnce(&state)
+
+	entries := readObservabilityLogEntries(t, logPath)
+	failures := findObservabilityEntries(entries, "handler_selection_failed")
+	if len(failures) == 0 {
+		t.Fatalf("expected handler_selection_failed event, got %+v", entries)
+	}
+	failure := failures[len(failures)-1]
+	if failure.Context["type"] != "mystery" {
+		t.Fatalf("expected unknown type in handler selection failure, got %+v", failure)
+	}
+	if failure.Context["retryable"] != false {
+		t.Fatalf("expected retryable=false for unknown handler type, got %+v", failure)
+	}
+}
+
+func TestTypedScriptFailureLogsObservedStateAndRetries(t *testing.T) {
+	tempDir := t.TempDir()
+	logPath := filepath.Join(tempDir, "logs", "agent.log")
+	withAgentLogPath(t, logPath)
+
+	cp, server := newFakeControlPlane(t, 4, "")
+	cp.mu.Lock()
+	cp.desiredTyped = &DesiredState{
+		WorkloadID: "script-fail",
+		Type:       "script",
+		Spec:       json.RawMessage(`{"command":"exit 7"}`),
+	}
+	cp.mu.Unlock()
+	withControlPlaneBase(t, server.URL)
+
+	state := initializeLocalState(tempDir)
+	runOnce(&state)
+	runOnce(&state)
+
+	if state.LastAppliedVersion != 0 {
+		t.Fatalf("last applied version = %d, want 0 after failed script", state.LastAppliedVersion)
+	}
+	observed, err := loadObservedState()
+	if err != nil {
+		t.Fatalf("load observed state: %v", err)
+	}
+	workload := observed.Workloads["script-fail"]
+	if workload.Status != "failed" {
+		t.Fatalf("observed failed workload status = %q, want failed", workload.Status)
+	}
+
+	entries := readObservabilityLogEntries(t, logPath)
+	if got := len(findObservabilityEntries(entries, "workload_execute_started")); got != 2 {
+		t.Fatalf("failed script should be retried, execute_started count = %d, want 2", got)
+	}
+	failures := findObservabilityEntries(entries, "workload_execute_failed")
+	if len(failures) != 2 {
+		t.Fatalf("expected two workload_execute_failed events, got %+v", failures)
+	}
+	lastFailure := failures[len(failures)-1]
+	if lastFailure.Context["retryable"] != true {
+		t.Fatalf("expected retryable=true for failed script, got %+v", lastFailure)
 	}
 }

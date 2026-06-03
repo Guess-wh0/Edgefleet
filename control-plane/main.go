@@ -51,9 +51,58 @@ type RegistrationResponse struct {
 }
 
 type DesiredStateEnvelope struct {
-	Version   int    `json:"version"`
-	Payload   string `json:"payload"`
-	Signature string `json:"signature"`
+	Version    int             `json:"version"`
+	WorkloadID string          `json:"workload_id,omitempty"`
+	Type       string          `json:"type,omitempty"`
+	Spec       json.RawMessage `json:"spec,omitempty"`
+	Payload    string          `json:"payload,omitempty"`
+	Signature  string          `json:"signature"`
+}
+
+type desiredStateSignatureBody struct {
+	Version    int             `json:"version"`
+	WorkloadID string          `json:"workload_id"`
+	Type       string          `json:"type"`
+	Spec       json.RawMessage `json:"spec"`
+}
+
+func (ds DesiredStateEnvelope) hasTypedWorkload() bool {
+	return ds.WorkloadID != "" || ds.Type != "" || len(ds.Spec) > 0
+}
+
+func (ds DesiredStateEnvelope) signingPayload() string {
+	if !ds.hasTypedWorkload() {
+		return ds.Payload
+	}
+
+	body := desiredStateSignatureBody{
+		Version:    ds.Version,
+		WorkloadID: ds.WorkloadID,
+		Type:       ds.Type,
+		Spec:       ds.Spec,
+	}
+	data, err := json.Marshal(body)
+	if err != nil {
+		return ""
+	}
+	return string(data)
+}
+
+func desiredStateEnvelopeFromPayload(version int, payload string, nodeSecret string, nodeID string) DesiredStateEnvelope {
+	var envelope DesiredStateEnvelope
+	if err := json.Unmarshal([]byte(payload), &envelope); err == nil && envelope.hasTypedWorkload() {
+		envelope.Version = version
+		envelope.Payload = ""
+		envelope.Signature = signDesiredState(nodeID, envelope.Version, envelope.signingPayload(), nodeSecret)
+		return envelope
+	}
+
+	envelope = DesiredStateEnvelope{
+		Version: version,
+		Payload: payload,
+	}
+	envelope.Signature = signDesiredState(nodeID, envelope.Version, envelope.signingPayload(), nodeSecret)
+	return envelope
 }
 
 func requireMethod(w http.ResponseWriter, r *http.Request, method string) bool {
@@ -330,11 +379,7 @@ func getDesiredState(w http.ResponseWriter, r *http.Request) {
 		"version": version,
 	}, fmt.Sprintf("[DESIRED_STATE_FETCH] node=%s version=%d time=%s", nodeID, version, time.Now().Format(time.RFC3339)))
 
-	envelope := DesiredStateEnvelope{
-		Version:   version,
-		Payload:   payload,
-		Signature: signDesiredState(nodeID, version, payload, nodeSecret),
-	}
+	envelope := desiredStateEnvelopeFromPayload(version, payload, nodeSecret, nodeID)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
